@@ -1,7 +1,5 @@
 // XtensaShrink.cpp
 
-// TODO: 40100fe1:	fdc951               	l32r	a5, 40100708:20c0ffcb wrong, also below
-
 // TODO: mark data arrays!: ? between ret and code?: list!!
 // 
 // Blinky first
@@ -91,15 +89,15 @@ ICACHE_FLASH_ATTR -> place in IROM
 // platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
 // Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin      Function pointers
 
-bool dump;
+bool errorTrace;
 
 const int base = 0x40100000;
 int topAddr; // relative to base
 
 typedef enum {out, io, dram, rom, iram, irom, cfg} Region;
 
-Region region(int addr) {
-  if (addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
+Region region(int addr, bool noBase = false) {
+  if (!noBase && addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
   if (addr < 0x3FF00000) return out;
   if (addr < 0x3FFC0000) return io;
   if (addr < 0x40000000) return dram;
@@ -291,7 +289,7 @@ void disasmAt(int startAddr, int stopAddr = 0) {
     _itoa(base + startAddr, hex + 5, 16); 
     hex[5 + 8] = ':';
     char* pHex = hex + 5 + 8 + 1;
-    while (mark[blockEnd] < code && blockEnd < stopAddr) { // dump data
+    while (mark[blockEnd] < code && blockEnd < stopAddr) { // errorTrace data
       if (pHex < hex + sizeof(hex) - 32) 
         pHex += sprintf(pHex, " %02X", text[blockEnd]);
       // else ... once
@@ -322,12 +320,11 @@ void cleanDisasm() {
   char l[256];
   while (fgets(l, sizeof(l), disasm)) {
     if (isdigit(l[0])) {
-      fputs("  ", clean);
       char* l32rPos = strstr(l, "l32r");
-      if (l32rPos) {
+      if (l32rPos && *(l32rPos + 9 + 8) != ':') {
         int ref;
         sscanf(l32rPos + 9, "%X", &ref);
-        if (region(ref) == iram) {
+        if (region(ref, true) == iram) {
           int load = *(int*)(text + ref - base);
           *(l32rPos + 9 + 8) = ':';
           _itoa(load, l32rPos + 9 + 9, 16);
@@ -391,13 +388,13 @@ int imm16Dest(int addr) {
   return ((addr + 3) & ~3) + ((0xFFFF0000 | *(short*)(text + addr + 1)) << 2);  // imm16 backwards
 }
 
-int l32rDest(int addr) {
+int l32rDest(int addr) { // TODO: check logic ****
   mark[addr + 1] = imm16;
   int dest = imm16Dest(addr);
   if (region(dest) != iram) return dest;
 
   int target = *(int*)(text + dest);
-  bool pointer = region(target) == iram;
+  bool pointer = region(target, true) == iram;
   mark[dest] = pointer ? ptr : data;
 
   return pointer ? target - base : dest;  // indirect
@@ -436,13 +433,14 @@ void compact() {
     if (addr == 0x2035)
       printf(".");  
 
-    relo = addr - displ(addr); // relocated location
+    int iDispl = displ(addr);
+    relo = addr - iDispl; // relocated location
 
     switch (mark[addr]) {
       case data:
       case ptr : {
         int dest = *(int*)(text + addr);
-        *(int*)(text + relo) = dest - (region(dest - base) == iram ? displ(dest - base) : 0);
+        *(int*)(text + relo) = dest - (region(dest, true) == iram ? displ(dest - base) : 0);
         addr += 4;
         }
         break;
@@ -451,15 +449,18 @@ void compact() {
         text[relo]   = text[addr];
         text[relo+1] = text[addr+1];
         if (!narrow)
-          text[relo+2] = text[addr+2];
-        int iDispl = displ(addr);  // TODO
+          text[relo+2] = text[addr+2];        
 
-        switch (mark[addr + 1]) {
-          case imm6: text[relo+1] -= iDispl - displ(imm6Dest(addr)); break; // forward only  TODO: carry to top bits (rare)
-          case imm8: text[relo+2] -= iDispl - displ(imm8Dest(addr)); break; // signed
-          case imm12: *(int*)(text+relo) -= (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; // signed
-          case imm16: *(unsigned short*)(text+relo+1) += (iDispl - displ(imm16Dest(addr))) >> 2; break; // back only
-          case imm18: *(int*)(text+relo) -= (iDispl - displ(call0Dest(addr))) << (24 - 20); break; // signed 
+        switch (mark[addr + 1]) { 
+          case imm6: { // forward offset
+            int ofs = (imm6Dest(addr) - displ(imm6Dest(addr))) - (relo + 4);
+            text[relo] = text[relo] & 0xCF | ofs & 0x30;  // MS 2 bits
+            text[relo+1] = text[relo + 1] & 0x0F | (ofs & 0xF) << 4; // LS nibble -> MS nibble
+          } break; 
+          case imm8: text[relo+2] += iDispl - displ(imm8Dest(addr)); break; // signed
+          case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; // signed
+          case imm16: *(signed short*)(text+relo+1) += (iDispl - displ(imm16Dest(addr))) >> 2; break;  // back offset (one-extended negative)
+          case imm18: *(int*)(text+relo) += (iDispl - displ(call0Dest(addr))) << (24 - 20); break; // signed 
         }
         addr += narrow ? 2 : 3;
         break;
@@ -471,6 +472,7 @@ void compact() {
 
   memset(shown, 0, sizeof(shown));
   memset(mark, unk, sizeof(mark));  // or move marks
+  traversed = false;
 }
 
 Mark instrType(int addr) { 
@@ -570,9 +572,7 @@ int routineAt(int start, int stop = 0) {
   return 0; // OK
 }
 
-int traverse(int addr) {  // fail addr
-  // dumpCode(addr);
-
+int traverse(int addr) {  // returns fail addr
   while (1) {
     if (region(addr) != iram) return 0;
 
@@ -630,7 +630,7 @@ int traverse(int addr) {  // fail addr
           dest = l32rDest(addr - 3);  // indirect   
           if (routineAt(dest)) {
             onError(addr - 3, dest, l32rDest(addr - 3), "callx0 oob");
-            return dump ? addr : 0;  
+            return errorTrace ? addr : 0;  
           }
           
           if ((failedAt = traverse(dest))) { // ? intervening instructions possible?
@@ -665,7 +665,7 @@ int traverse(int addr) {  // fail addr
           }
         } 
       #else
-        onError(-base, addr - 8, addr, "jx");  return 0;  // dump more context before jx   jmp to base + at * 3  (jx instrs)
+        onError(-base, addr - 8, addr, "jx");  return 0;  // errorTrace more context before jx   jmp to base + at * 3  (jx instrs)
       #endif
         break;
 
@@ -679,7 +679,7 @@ int traverse(int addr) {  // fail addr
 
       case ill: 
         onError(addr, "ill");
-        return dump ? addr : 0;
+        return errorTrace ? addr : 0;
 
       default: onError(addr, "mark"); return addr;
     }
@@ -714,6 +714,21 @@ void copyToElf(int start = 0, int len = 0) {  // only for objdump disasm!!
   // https://github.com/jsandin/esp-bin2elf/blob/master/esp_bin2elf.py
 }
 
+int countMarked() {
+  int marked = 0;
+  for (int addr = 0; addr < topAddr; addr += 4)
+    if (mark[addr]) {
+      if (!marked) {
+        first = addr;
+        printf("\nFirst %X\n", base+first);
+      }
+      marked += 4;
+      last = addr;
+    }
+  printf("Last  %X\n", base + last);
+  printf("%d bytes marked\n\n", marked);
+  return marked;
+}
 
 int main(int argc, char** argv) {
   if (_chdir("..")) exit(3);
@@ -735,21 +750,11 @@ int main(int argc, char** argv) {
   int failedAt;
   if ((failedAt = traverse(esp_image_header.entry_addr - base)))
     onError(failedAt, "top");
-
-  int marked = 0;
-  for (int addr = 0; addr < topAddr; addr += 4)
-    if (mark[addr]) {
-      if (!(marked += 4)) {
-        first = addr;
-        printf("\nFirst %X\n", base+first);
-      }
-      last = addr;
-    }
-  printf("Last  %X\n", base + last);
-  printf("%d bytes marked\n\n", marked);
   traversed = true;
-
+  int markedOrig = countMarked();
   disasmAt(first, last + 1);
+  cleanDisasm();
+  system("copy disasm.clean.txt disasm.txt >> NUL");
 
   system("echo . >> disasm.txt");
   system("echo ********* PACKED BELOW ************* >> disasm.txt");
@@ -758,18 +763,21 @@ int main(int argc, char** argv) {
   compact();
 
   copyToElf(first, last - first + 1);
-  dump = true;
+  errorTrace = true;
   traverse(esp_image_header.entry_addr - base - displ(esp_image_header.entry_addr - base));
-  disasmAt(first, last);
-
-  strcat(binPath, ".shrink.bin");
-  writeBin(binPath);
+  traversed = true;
+  int markedShrink = countMarked();
+  disasmAt(first, last + 1);
 
   cleanDisasm();
 
-  char espCmd[512] = "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf ";
-  strcat(espCmd, binPath);
-  // system(espCmd);
+  if (markedOrig == markedShrink) {
+    strcat(binPath, ".shrink.bin");
+    writeBin(binPath);
+    char espCmd[512] = "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf ";
+    strcat(espCmd, binPath);
+    system(espCmd);
+  }
 }
 
 // https://richard.burtons.org/2015/05/17/esp8266-boot-process/
