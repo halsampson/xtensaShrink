@@ -1,15 +1,15 @@
 // XtensaShrink.cpp
 
-// TODO: mark data arrays!: ? between ret and code?: list!!
-// 
 // Blinky first
 
-// check handling function address parameters passed to routines (in other registers l32r at, )
-//   used in Tasmota -- arrays of driver routines
-//   try small test program to check code generated
+// TODO: data arrays: addr + ofs code ??
 
 // ?? no use of LITBASE? for L32R?  Special Reg 5
 // build firmware with VTABLES_IN_ROM
+
+const bool doCompact = 0;
+
+#define EspTool "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf "
 
 /*
 https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
@@ -94,23 +94,24 @@ bool errorTrace;
 const int base = 0x40100000;
 int topAddr; // relative to base
 
-typedef enum {out, io, dram, rom, iram, irom, cfg} Region;
+typedef enum {cnst, io, dram, rom, iram, irom, cfg} Region;
 
 Region region(int addr, bool noBase = false) {
   if (!noBase && addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
-  if (addr < 0x3FF00000) return out;
-  if (addr < 0x3FFC0000) return io;
-  if (addr < 0x40000000) return dram;
-  if (addr < 0x40100000) return rom;
-  if (addr < 0x40200000) return iram;
-  if (addr < 0x40280000) return irom;
-  if (addr >= 0x60000000 && addr < 0x60002000) return cfg;
-  return out;  // const ??
+
+  switch (addr & 0xFFF00000) {
+    case 0x3FF00000: return addr >= 0x3FFE0000 ? dram : io;
+    case 0x40000000: return rom;
+    case 0x40100000: return iram;
+    case 0x40200000: return irom;
+    case 0x60000000: return cfg;
+    default: return cnst; // const
+  }
 }
 
 const int MaxCodeSize = 4000000;  // could malloc / compact segments 0x3FFE0000 0x40100000 0x40200000
 
-typedef enum {unk, data, ptr, ill, err, code, other, l32r, call0, callx0, callxn, ret, branch, jmp, jx, swTbl, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
+typedef enum {unk, data, ptr, ill, err, code, other, l32r, call0, callx0, callxn, ret, branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
 
 BYTE text[MaxCodeSize];
 Mark mark[MaxCodeSize];
@@ -164,6 +165,13 @@ struct {
 
 // https://github.com/espressif/esptool/wiki/Firmware-Image-Format
 
+const int RAMbase = 0x3FFE8000;
+int ram[2048 / sizeof(int)];
+
+BYTE* segBase(int addr) {
+  return region(addr) == iram ? text - base : (BYTE*)ram - RAMbase;
+}
+
 void readBin(const char* binPath) {
   int totalLen = 0;
   FILE* bin = fopen(binPath, "rb");
@@ -190,10 +198,8 @@ void readBin(const char* binPath) {
         }
       }
 
-      int ofs = esp_image_segment_header[i].load_addr - base;
-      if (ofs >= 0)
-        fread(text + ofs, 1, esp_image_segment_header[i].data_len, bin);
-      else fseek(bin, esp_image_segment_header[i].data_len, SEEK_CUR);
+      int ofs = esp_image_segment_header[i].load_addr;
+      fread(segBase(ofs) + ofs, 1, esp_image_segment_header[i].data_len, bin);
     }
 
     int fPos = ftell(bin);
@@ -224,17 +230,18 @@ int first, last;
 void writeBin(const char* binPath) {
   FILE* bin = fopen(binPath, "wb");
 
-#if 1
-  esp_image_header.segment_count = 1;
+#if 0
   esp_image_segment_header[0].load_addr = (base + first + 3) & 0xFFFFFFFC;
   esp_image_segment_header[0].data_len =  (last + 1 - first + 3) & 0xFFFFFFFC;
+  // esp_image_header.segment_count = 1; // DRAM content - for loader??
 #endif
 
   fwrite(&esp_image_header, sizeof(esp_image_header), 1, bin);
 
   for (int i = 0; i < esp_image_header.segment_count; ++i) {
     fwrite(&esp_image_segment_header[i], sizeof(esp_image_segment_header[0]), 1, bin);
-    writeAndSum(text + esp_image_segment_header[i].load_addr - base, esp_image_segment_header[i].data_len, bin);
+    int ofs = esp_image_segment_header[i].load_addr;
+    writeAndSum(segBase(ofs) + ofs, esp_image_segment_header[i].data_len, bin);
   }
 
   int fill = 15 - ftell(bin) % 16;
@@ -342,9 +349,6 @@ void cleanDisasm() {
   fclose(disasm);
 }
 
-
-
-
 int imm6Dest(int addr) {
   int ofs = *(unsigned short*)(text + addr);
   ofs = (ofs & 0x30) | (ofs & 0xF000) >> 12; //  6 bits forward only
@@ -395,13 +399,11 @@ int call0Dest(int addr) {
 int l32rDest(int addr) { // TODO: check logic ****
   mark[addr + 1] = imm16;
   int dest = imm16Dest(addr);
-  if (region(dest) != iram) return dest;
+  if (dest < 0) printf("l32r dram @ %X\n", addr);
+  mark[dest] = ptr; // TODO: plus maybe more following in array
 
   int target = *(int*)(text + dest);
-  bool pointer = region(target, true) == iram;
-  mark[dest] = pointer ? ptr : data;
-
-  return pointer ? target - base : dest;  // indirect
+  return target - base;  // indirect
 }
 
 void addrAt(int addr) {
@@ -412,15 +414,20 @@ void addrAt(int addr) {
 unsigned short mapOfs[MaxCodeSize >> 2]; // compaction offset >> 2
 
 int displ(int addr) { // compaction displacement
+  if (region(base + addr, true) != iram) {  // call to library
+    return 0;
+  }
   return mapOfs[addr >> 2] << 2;
 }
 
 void compact() {
   int ofs = 0;
   int addr;
+  Mark lastMark = code;
   for (addr = first; addr <= last; addr += 4) {
-    mapOfs[addr >> 2] = ofs;    
-    if (!mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3])
+    mapOfs[addr >> 2] = ofs;
+    if (mark[addr]) lastMark = mark[addr];
+    if (lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3])
       ++ofs; // hole
     // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
@@ -589,12 +596,13 @@ int traverse(int addr) {  // returns fail addr
     if (region(addr) != iram) return 0;
 
     switch (mark[addr]) {
-      case unk: break;
+      case unk: break;  // still to traverse
       case imm6:
       case imm8:
       case imm12:
       case imm16:
       case imm18:
+      case imm20:
       case code1: onError(addr - 1, "mid1"); return addr;  
       case code2: onError(addr - 2, "mid2"); return addr;  
       case ptr: 
@@ -616,7 +624,7 @@ int traverse(int addr) {  // returns fail addr
       case l32r:
         dest = l32rDest(addr);
         if (region(dest) == iram) {
-          if ((failedAt = traverse(dest))) {
+          if ((failedAt = traverse(dest))) { // fn ptr, ...
             onError(addr, dest, failedAt, "l32r");
             return addr;
           }
@@ -639,17 +647,17 @@ int traverse(int addr) {  // returns fail addr
       case callx0:  
         if ((text[addr - 3] & 0xF) == 1
          && (text[addr - 3] & 0xF0) >> 4 == (text[addr + 1] & 0xF)) { // l32r same register
-          dest = l32rDest(addr - 3);  // indirect   
+          dest = l32rDest(addr - 3);  // indirect   // ? intervening instructions possible?
           if (routineAt(dest)) {
             onError(addr - 3, dest, l32rDest(addr - 3), "callx0 oob");
             return errorTrace ? addr : 0;  
           }
           
-          if ((failedAt = traverse(dest))) { // ? intervening instructions possible?
+          if ((failedAt = traverse(dest))) { // already traversed by l32r
             onError(addr, dest, failedAt, "callx0");
             return addr;
           }
-        }
+        } else printf("callx0 no l32r\a\n");
         break;
       case ret: return 0;
 
@@ -743,6 +751,15 @@ int countMarked() {
   return marked;
 }
 
+void reloRam() {
+  for (int a = 0; a < sizeof(ram) / sizeof(ram[0]); ++a) {
+    if (region(ram[a], true) == iram) {
+      printf("ram %X:%X\n", RAMbase + a, ram[a]);
+      ram[a] -= displ(ram[a]);
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   if (_chdir("..")) exit(3);
   system("echo . > disasm.txt");
@@ -773,7 +790,10 @@ int main(int argc, char** argv) {
   system("echo ********* PACKED BELOW ************* >> disasm.txt");
   system("echo . >> disasm.txt");
 
-  compact();
+  if (doCompact) {
+    compact();
+    reloRam();
+  }
 
   copyToElf(first, last - first + 1);
   errorTrace = true;
@@ -787,11 +807,38 @@ int main(int argc, char** argv) {
   if (markedOrig == markedShrink) {
     strcat(binPath, ".shrink.bin");
     writeBin(binPath);
-    char espCmd[512] = "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf ";
+    char espCmd[512] = EspTool;
     strcat(espCmd, binPath);
     system(espCmd);
   }
 }
 
+/*
+Flashed to 4096 byte sectors according to partition table
+ 
+Compressed 196136 bytes to 144322...  
+Writing at 0x00010000... (11 %)
+Writing at 0x00030000... (100 %)
+Wrote 196136 bytes (144322 compressed) at 0x00010000 in 1.6 seconds (effective 990.7 kbit/s)...     irom0text.bin  (once - no magic E9)
+
+Compressed 128 bytes to 75...
+Writing at 0x003fc000... (100 %)
+Wrote 128 bytes (75 compressed) at 0x003fc000 in 0.0 seconds (effective 258.5 kbit/s)...   config 
+
+Compressed 4096 bytes to 26...
+Writing at 0x003fe000... (100 %)
+Wrote 4096 bytes (26 compressed) at 0x003fe000 in 0.0 seconds (effective 10950.4 kbit/s)... config 
+
+Compressed 26464 bytes to 19810...
+Writing at 0x00000000... (50 %)
+Writing at 0x00004000... (100 %)
+Wrote 26464 bytes (19810 compressed) at 0x00000000 in 0.2 seconds (effective 1329.6 kbit/s)...
+*/
+
+
+
+
 // https://richard.burtons.org/2015/05/17/esp8266-boot-process/
 // https://github.com/raburton/esptool2  Windows C
+
+
