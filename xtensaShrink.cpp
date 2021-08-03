@@ -1,16 +1,13 @@
 // XtensaShrink.cpp
 
+// dump compact traverse vs. orig - where first differs?
+
 // Blinky first
 
-// TODO: where do vectors at 0x40000000 go to?
-//    esptool.py dump_mem 0x40000000 l024 vectors.bin
+// data arrays: addr + ofs code 
+
+// no use of LITBASE for L32R with Special Reg 5
 // build firmware with VTABLES_IN_ROM 
-// 
-//  
-// TODO: data arrays: addr + ofs code ??
-
-// ?? no use of LITBASE? for L32R?  Special Reg 5
-
 
 const bool doCompact = 1;
 
@@ -256,6 +253,30 @@ void writeBin(const char* binPath) {
   fclose(bin);
 }
 
+unsigned short mapOfs[MaxCodeSize >> 2]; // compaction offset >> 2
+
+int displ(int addr) { // compaction displacement
+  if (region(base + addr, true) != iram) {  // call to library
+    return 0;
+  }
+  return mapOfs[addr >> 2] << 2;
+}
+
+
+int origAddr(int addr) {
+  static int origAddr;
+  int lsBits = addr & 3;
+  addr &= ~3;
+  while (1) {
+    int ofs = addr - (origAddr - displ(origAddr));
+    if (ofs == 0) return origAddr | lsBits;
+    if ( ofs >= 4) origAddr += 4;
+    else if (ofs <= -4) origAddr -= 4;    
+    // better faster convergence!!
+  }
+  return origAddr;
+}
+
 // outputs differ - FPU option
 const char objDump[] = "C:\\users\\Admin\\.platformio\\packages\\toolchain-xtensa\\bin\\xtensa-lx106-elf-objdump.exe"; 
 // const char objDump[] = "xtensa-esp32-elf\\bin\\xtensa-esp32-elf-objdump.exe"; // FPU
@@ -272,10 +293,15 @@ void disasmAt(const char* symbol) {
   system("echo . >> disasm.txt");  // separator 
 }
 
-bool traversed;
+bool traversed, shrunk;
 
 void doDisasm(int startAddr, int stopAddr) {
   char disasmCmd[512];
+  if (shrunk) {
+    sprintf_s(disasmCmd, sizeof(disasmCmd), "echo (%X): >> disasm.txt", base + origAddr(startAddr));
+    system(disasmCmd);
+  }
+
   sprintf_s(disasmCmd, sizeof(disasmCmd), 
             "%s -d --start-address=0x%X --stop-address=0x%X %s >> disasm.txt", objDump, base + startAddr, base + stopAddr, disasmElfPath);
   system(disasmCmd);
@@ -331,7 +357,7 @@ void cleanDisasm() {
 
   char l[256];
   while (fgets(l, sizeof(l), disasm)) {
-    if (isdigit(l[0])) {
+    if (isdigit(l[0]) || l[0] == '(') {
       char* l32rPos = strstr(l, "l32r");
       if (l32rPos && *(l32rPos + 9 + 8) != ':') {
         int ref;
@@ -419,24 +445,16 @@ void addrAt(int addr) {
   printf("%X:%X %d\n", addr, *(int*)(text + addr - base), mark[addr - base]);
 }
 
-unsigned short mapOfs[MaxCodeSize >> 2]; // compaction offset >> 2
-
-int displ(int addr) { // compaction displacement
-  if (region(base + addr, true) != iram) {  // call to library
-    return 0;
-  }
-  return mapOfs[addr >> 2] << 2;
-}
-
 void compact() {
+  // find holes for compacted displacement mapping:
   int ofs = 0;
   int addr;
   Mark lastMark = code;
   for (addr = first; addr <= last; addr += 4) {
     mapOfs[addr >> 2] = ofs;
     if (mark[addr]) lastMark = mark[addr];
-    if (lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3])
-      ++ofs; // hole
+    if (addr > 0x90 && lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3])
+      ++ofs; // hole; interrupt vectors don't move!
     // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
 
@@ -491,6 +509,7 @@ void compact() {
   printf("\nPacked to %d bytes\n", last - first);
 
   traversed = false;
+  shrunk = true;
   memset(mark, unk, sizeof(mark));  // or move marks
   memset(shown, 0, sizeof(shown));
 }
@@ -527,16 +546,6 @@ Mark instrType(int addr) {
   if (narrow == 0xF00D) return ret;  // ret.n
   if (narrow == 0xF06D) return ill;
   return other;
-}
-
-int origAddr(int addr) {
-  int origAddr = 0;
-  while (1) {
-    int ofs = addr - (origAddr - displ(origAddr));
-    if (ofs <= 0) break;
-    ++origAddr; // better faster convergence!!
-  }
-  return origAddr;
 }
 
 void onError(int addr, const char* type) {
@@ -606,6 +615,7 @@ int routineAt(int start, int stop = 0) {
 }
 
 int traverse(int addr) {  // returns fail addr
+  printf("%X ", shrunk ? origAddr(addr):addr); // to compare
   while (1) {
     if (region(addr) != iram) return 0;
 
@@ -783,6 +793,13 @@ void reloRam() {
   }
 }
 
+void markIntrs() {
+  for (int vect = 0x10; vect <= 0x80; vect += 0x10)   // relocated via wsr.vecbase 0x40100000
+    if (*(int*)(text + vect)) 
+      traverse(vect);
+  // else printf("Vect %X no code\n", vect);
+}
+
 int main(int argc, char** argv) {
   if (_chdir("..")) exit(3);
   system("echo . > disasm.txt");
@@ -803,11 +820,8 @@ int main(int argc, char** argv) {
   int failedAt;
   if ((failedAt = traverse(esp_image_header.entry_addr - base)))
     onError(failedAt, "top");
-  for (int vect = 0x10; vect <= 0x80; vect += 0x10)   // relocated via wsr.vecbase 0x40100000
-    if (*(int*)(text + vect)) 
-      traverse(vect);
-    // else printf("Vect %X no code\n", vect);
 
+  markIntrs();
   traversed = true;
   int markedOrig = countMarked();
 
@@ -827,6 +841,7 @@ int main(int argc, char** argv) {
   copyToElf(first, last - first + 1);
   errorTrace = true;
   traverse(esp_image_header.entry_addr - base - displ(esp_image_header.entry_addr - base));
+  markIntrs();
   traversed = true;
   int markedShrink = countMarked();
   disasmAt(first, last + 1);
