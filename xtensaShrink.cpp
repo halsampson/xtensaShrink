@@ -110,12 +110,12 @@ Region region(int addr, bool noBase = false) {
 
 const int MaxCodeSize = 4000000;  // could malloc / compact segments 0x3FFE0000 0x40100000 0x40200000
 
-typedef enum {unk, data, ptr, ill, err, code, other, l32r, call0, callx0, callxn, ret, branch, jmp, jx, swTbl, code1, code2, imm6, imm8, imm12, imm16, imm18} Mark;
+typedef enum {unk, data, ptr, ill, err, code, other, l32r, call0, callx0, callxn, ret, branch, jmp, jx, swTbl, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
 
 BYTE text[MaxCodeSize];
 Mark mark[MaxCodeSize];
 
-const int ShownShift = 3;  // min routine 8 bytes
+const int ShownShift = 0;  // min routine 8 bytes
 BYTE shown[MaxCodeSize >> ShownShift];  // better a bit field
 
 // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/app_image_format.html
@@ -275,7 +275,7 @@ void disasmAt(int startAddr, int stopAddr = 0) {
   if (stopAddr > 0x30000000) stopAddr -= base;
   if (!stopAddr) stopAddr = startAddr + 32;
 
-  if (shown[startAddr >> ShownShift]) return;
+  //if (shown[startAddr >> ShownShift]) return;
   shown[startAddr >> ShownShift] = 1;
 
   if (!traversed) {
@@ -343,11 +343,7 @@ void cleanDisasm() {
 }
 
 
-int jmpDest(int addr) {
-  mark[addr + 1] = imm18;
-  int ofs = (*(int*)(text + addr) << 8) >> (32 - 18); // sign-extended 18 bits  
-  return addr + ofs + 4;
-}
+
 
 int imm6Dest(int addr) {
   int ofs = *(unsigned short*)(text + addr);
@@ -378,14 +374,22 @@ int branchDest(int addr) {
   }
 }
 
-int call0Dest(int addr) {
-  mark[addr + 1] = imm18;
-  int ofs = ((*(int*)(text + addr) & 0xFFFFC0) << (32 - 24) >> (32 - 20));  // signed 18 bits << 2 = 20 bits
-  return (addr & ~3) + ofs + 4;
-}
-
 int imm16Dest(int addr) {
   return ((addr + 3) & ~3) + ((0xFFFF0000 | *(short*)(text + addr + 1)) << 2);  // imm16 backwards
+}
+
+int imm18ofs(int addr) {
+  return (*(int*)(text + addr) << 8) >> (32 - 18); // sign-extended 18 bits
+}
+
+int jmpDest(int addr) {
+  mark[addr + 1] = imm18;
+  return addr + imm18ofs(addr) + 4;
+}
+
+int call0Dest(int addr) {
+  mark[addr + 1] = imm20;
+  return (addr & ~3) + (imm18ofs(addr) << 2) + 4;
 }
 
 int l32rDest(int addr) { // TODO: check logic ****
@@ -421,7 +425,6 @@ void compact() {
     // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
 
-
   int relo = first;
   for (addr = first; addr <= last;) {
     bool narrow = text[addr] & 0x8;  // MSB set = narrow p 575
@@ -451,16 +454,18 @@ void compact() {
         if (!narrow)
           text[relo+2] = text[addr+2];        
 
+        int ofs;
         switch (mark[addr + 1]) { 
-          case imm6: { // forward offset
-            int ofs = (imm6Dest(addr) - displ(imm6Dest(addr))) - (relo + 4);
+          case imm6:  // forward offset
+            ofs = imm6Dest(addr) - displ(imm6Dest(addr)) - (relo + 4);
             text[relo] = text[relo] & 0xCF | ofs & 0x30;  // MS 2 bits
             text[relo+1] = text[relo + 1] & 0x0F | (ofs & 0xF) << 4; // LS nibble -> MS nibble
-          } break; 
+            break; 
           case imm8: text[relo+2] += iDispl - displ(imm8Dest(addr)); break; // signed
-          case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; // signed
+          case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; 
           case imm16: *(signed short*)(text+relo+1) += (iDispl - displ(imm16Dest(addr))) >> 2; break;  // back offset (one-extended negative)
-          case imm18: *(int*)(text+relo) += (iDispl - displ(call0Dest(addr))) << (24 - 20); break; // signed 
+          case imm18: *(int*)(text+relo) += (iDispl - displ(jmpDest(addr))) << (24 - 18); break;
+          case imm20 : *(int*)(text+relo) += (iDispl - displ(call0Dest(addr))) << (24 - 20); break;
         }
         addr += narrow ? 2 : 3;
         break;
@@ -470,9 +475,9 @@ void compact() {
 
   printf("\nPacked to %d bytes\n", last - first);
 
-  memset(shown, 0, sizeof(shown));
-  memset(mark, unk, sizeof(mark));  // or move marks
   traversed = false;
+  memset(mark, unk, sizeof(mark));  // or move marks
+  memset(shown, 0, sizeof(shown));
 }
 
 Mark instrType(int addr) { 
@@ -503,7 +508,15 @@ Mark instrType(int addr) {
   return other;
 }
 
-const char startSymbol[] = "call_user_start";
+int origAddr(int addr) {
+  int origAddr = 0;
+  while (1) {
+    int ofs = addr - (origAddr - displ(origAddr));
+    if (ofs <= 0) break;
+    ++origAddr; // better faster convergence!!
+  }
+  return origAddr;
+}
 
 void onError(int addr, const char* type) {
   char cmd[64];
@@ -511,29 +524,28 @@ void onError(int addr, const char* type) {
   system(cmd);
 
   int stopAddr = addr;
-  for (int i = 2; i--;)
+  for (int i = 4; i--;)
     stopAddr += text[stopAddr] & 0x8 ? 2 : 3;
 
   // mark[addr] = err;
 
-  printf("%s @ %X\n", type, base + addr);
+  printf("%6s @ %X(%X)\n", type, base + addr, base + origAddr(addr));
   disasmAt(addr, stopAddr);
 }
 
 void onError(int addr, int dest, int failedAt, const char* type) {
   char cmd[128];
-  sprintf_s(cmd, sizeof(cmd), "echo %s @ %X to %X .. %X >> disasm.txt", type, addr + base, dest + base, failedAt + base);
+  int orig = base + origAddr(addr);
+  sprintf_s(cmd, sizeof(cmd), "echo %s @ %X(%X) to %X..%X >> disasm.txt", type, addr + base, orig, dest + base, failedAt + base);
   system(cmd);
 
- //  mark[dest] = err;
-
   if (dest >= 0 && failedAt >= dest) {
-    for (int i = 2; i--;)
+    for (int i = 4; i--;)
       failedAt += text[failedAt] & 0x8 ? 2 : 3;
     disasmAt(dest, failedAt);
   } else disasmAt(addr);
 
-  printf("%s @ %X %X %X\n", type, base + addr, base + dest, base + failedAt);
+  printf("%6s @ %X(%X)->%X..%X\n", type, base + addr, orig, base + dest, base + failedAt);
 }
 
 void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
@@ -583,8 +595,8 @@ int traverse(int addr) {  // returns fail addr
       case imm12:
       case imm16:
       case imm18:
-      case code1: 
-      case code2: onError(addr, "mid"); return addr;  
+      case code1: onError(addr - 1, "mid1"); return addr;  
+      case code2: onError(addr - 2, "mid2"); return addr;  
       case ptr: 
       case data: return 0;
       case err: return 0; // already reported
@@ -725,6 +737,7 @@ int countMarked() {
       marked += 4;
       last = addr;
     }
+  last += 2; // ret
   printf("Last  %X\n", base + last);
   printf("%d bytes marked\n\n", marked);
   return marked;
