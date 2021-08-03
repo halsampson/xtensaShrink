@@ -2,12 +2,17 @@
 
 // Blinky first
 
+// TODO: where do vectors at 0x40000000 go to?
+//    esptool.py dump_mem 0x40000000 l024 vectors.bin
+// build firmware with VTABLES_IN_ROM 
+// 
+//  
 // TODO: data arrays: addr + ofs code ??
 
 // ?? no use of LITBASE? for L32R?  Special Reg 5
-// build firmware with VTABLES_IN_ROM
 
-const bool doCompact = 0;
+
+const bool doCompact = 1;
 
 #define EspTool "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf "
 
@@ -396,10 +401,13 @@ int call0Dest(int addr) {
   return (addr & ~3) + (imm18ofs(addr) << 2) + 4;
 }
 
-int l32rDest(int addr) { // TODO: check logic ****
+int l32rDest(int addr) {
   mark[addr + 1] = imm16;
   int dest = imm16Dest(addr);
-  if (dest < 0) printf("l32r dram @ %X\n", addr);
+  if (dest < 0) {
+    printf("%X:%X l32r ref ??\n", base + addr, base + dest); 
+    return dest;
+  }
   mark[dest] = ptr; // TODO: plus maybe more following in array
 
   int target = *(int*)(text + dest);
@@ -488,6 +496,7 @@ void compact() {
 }
 
 Mark instrType(int addr) { 
+  if (addr < 0) return ill;
   int op = text[addr];
   if ((op & 0x0F) == 1) return l32r;
   if ((op & 0x3F) == 5) return call0;
@@ -506,6 +515,11 @@ Mark instrType(int addr) {
   if (anyReg == 0x80) return ret;  // in data
   if (anyReg == 0xA0) return jx;
   if (anyReg == 0xC0) return callx0;
+  if (anyReg == 0x3010) return ret; // rfi
+  if (anyReg == 0x3000) return ret; // rfe
+  if (anyReg == 0xF17010) return ret; // rfdd
+  // TODO: more return types!!
+
 
   if ((anyReg & 0xFFFFCF) == 0xC0) return callxn;  // not used
 
@@ -657,7 +671,7 @@ int traverse(int addr) {  // returns fail addr
             onError(addr, dest, failedAt, "callx0");
             return addr;
           }
-        } else printf("callx0 no l32r\a\n");
+        } // else printf("%X: callx0 well after l32r\n", base + addr); // OK - could keep track of registers
         break;
       case ret: return 0;
 
@@ -672,8 +686,15 @@ int traverse(int addr) {  // returns fail addr
       case jx: 
       #if 1
         {
-          int switchTbl = l32rDest(addr - 8); // table of jmps: 3 bytes per entry
-          while (1) {
+          int switchTbl = 0;
+          // TODO: other possibile intervening instructions ****
+          if (instrType(addr-8) == l32r) 
+            switchTbl = l32rDest(addr - 8); 
+          else if (instrType(addr-13) == l32r) 
+            switchTbl = l32rDest(addr - 13); 
+                    
+          // table of jmps: 3 bytes per entry
+          if (region(switchTbl) == iram) while (1) {
             int iType = instrType(switchTbl);
             if (iType < call0 || iType > jx) return 0;
             // printf("s%X ", base + switchTbl);
@@ -683,6 +704,7 @@ int traverse(int addr) {  // returns fail addr
             }  
             switchTbl += 3;      
           }
+          return 0;
         } 
       #else
         onError(-base, addr - 8, addr, "jx");  return 0;  // errorTrace more context before jx   jmp to base + at * 3  (jx instrs)
@@ -698,6 +720,7 @@ int traverse(int addr) {  // returns fail addr
         continue;
 
       case ill: 
+        if (addr < 0x80) return 0; // vector calls don't return
         onError(addr, "ill");
         return errorTrace ? addr : 0;
 
@@ -780,8 +803,14 @@ int main(int argc, char** argv) {
   int failedAt;
   if ((failedAt = traverse(esp_image_header.entry_addr - base)))
     onError(failedAt, "top");
+  for (int vect = 0x10; vect <= 0x80; vect += 0x10)   // relocated via wsr.vecbase 0x40100000
+    if (*(int*)(text + vect)) 
+      traverse(vect);
+    // else printf("Vect %X no code\n", vect);
+
   traversed = true;
   int markedOrig = countMarked();
+
   disasmAt(first, last + 1);
   cleanDisasm();
   system("copy disasm.clean.txt disasm.txt >> NUL");
