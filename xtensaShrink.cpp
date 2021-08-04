@@ -1,85 +1,18 @@
 // XtensaShrink.cpp
 
-// dump compact traverse vs. orig - where first differs?
-
 // Blinky first
 
-// data arrays: addr + ofs code 
+// data arrays: look for addr + ofs code 
 
 // no use of LITBASE for L32R with Special Reg 5
 // build firmware with VTABLES_IN_ROM 
 
-const bool doCompact = 1;
+// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
+// Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin      Function pointers
 
-#define EspTool "C:\\Users\\Admin\\.platformio\\packages\\tool-esptool\\esptool.exe -v -cd nodemcu -cp COM23 -cb 115200 -cf "
+const bool doCompact = 0;
 
-/*
-https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
-
- I/O: 0x3FF00000..0x3FFC0000
- RAM: 0x3FFE0000..0x40000000   (<50 KB of 80KB available??) stack/heap
- ROM: 0x40000000..0x40100000   (x2)
-IRAM: 0x40100000..0x40140000   32KB, loaded from flash by bootloader
-IROM: 0x40200000..0x40280000   SPI flash
- cfg: 0x60000000..0x60002000
-
-Local Memory     
-XLMI start address / size                                     0x3ff00000 / 256K max 
-Data ROM start address / size                                 0x3ff40000 / 256K
-Data RAM [1] start address / size                             0x3ff80000 / 256K
-Data RAM [0] start address / size                             0x3ffc0000 / 256K
-   ESP8285/6: 96KB of DRAM space, ~80KB available to user
-
-Instruction RAM [0] start address / size                      0x40000000 / 1M
-Exception Vectors:
-Level 2 Interrupt Vector (Debug) start address / size         0x40000010 / 0xc
-Level 3 Interrupt Vector (NMI vector) start address / size    0x40000020 / 0xc
-Kernel (Stacked) Exception Vector start address / size        0x40000030 / 0x1c
-User (Program) Exception Vector start address / size          0x40000050 / 0x1c
-Double Exception Vector start address / size                  0x40000070 / 0x10
-Reset                                                         0x40000080
-
-Instruction RAM [1] start address / size                      0x40100000 / 1M
-64K IRAM has one dedicated 32K block of IRAM and two 16K blocks of IRAM. The last two 16K blocks of IRAM can cache flash memory, ICACHE.
-Data access in IRAM or ICACHE must always be a full 32-bit word and aligned.
-
-Instruction ROM start address / size                          0x40200000 / 1M
-
-Reset Vector start address / size                             0x50000000 / 0x300
-
-Memmory-Mapped I/O Registers
-Base      Size	Name	Description
-60000000h	80h	  uart0	UART0 config registers, see examples/IoT_Demo/include/drivers/uart_register.h
-60000100h	100h	spi1	SPI controller registers, see examples/IoT_Demo/include/driver/spi_register.h
-60000200h	100h	spi0	SPI controller registers, see examples/IoT_Demo/include/driver/spi_register.h
-60000300h	74h	  gpio	Timer config registers, see include/eagle_soc.h
-60000600h	28h	  timer	Tmer config registers, see include/eagle_soc.h
-60000700h	A4h	  rtc	  RTC config registers, see include/eagle_soc.h
-60000800h	44h	  iomux	IO MUX config registers, see include/eagle_soc.h
-
-iomux Pin Registers (60000804h–60000843h)
-31    24       16        8        0
--------- -ffff--- -------- ud--UDEe
-          `- Function      ||  |||`- Output Enable
-                           ||  ||`- Output Enable during sleep
-                           ||  |`- Pull-down during sleep
-                           ||  `- Pull-up during sleep
-                           |`- Pull-down
-                           `- Pull-up
-
-60000d00h	>=8	  i2c	  I2C controller registers, see ROM functions rom_i2c_readReg, rom_i2c_writeReg
-60000F00h	80h	  uart1	UART1 config registers, see examples/IoT_Demo/include/drivers/uart_register.h
-60001000h	100h	rtcb	RTC backup memory, see rtc_mem_backup
-60001100h	100h	rtcs	RTC system memory, see system_rtc_mem_write
-
-
-https://arduino-esp8266.readthedocs.io/en/latest/mmu.html
-
-Code in IROM runs at 1/4 - 1/12 speed since SPI flash (four data lines) is not nearly as fast as the internal static IRAM.
-Interrupt handlers and code that writes to flash must be run from IRAM.
-
-ICACHE_FLASH_ATTR -> place in IROM
-*/
+#define EspTool "C:\\Users\\Admin\\.platformio\\penv\\Scripts\\esptool --port COM23 --baud 2000000 write_flash 0 "
 
 #include <direct.h>
 #include <stdlib.h>
@@ -87,9 +20,6 @@ ICACHE_FLASH_ATTR -> place in IROM
 #include <string.h>
 #include <windows.h>
 #include <share.h>
-
-// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
-// Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin      Function pointers
 
 bool errorTrace;
 
@@ -615,7 +545,7 @@ int routineAt(int start, int stop = 0) {
 }
 
 int traverse(int addr) {  // returns fail addr
-  printf("%X ", shrunk ? origAddr(addr):addr); // to compare
+  // printf("%X ", shrunk ? origAddr(addr):addr); // to compare
   while (1) {
     if (region(addr) != iram) return 0;
 
@@ -881,8 +811,75 @@ Wrote 26464 bytes (19810 compressed) at 0x00000000 in 0.2 seconds (effective 132
 
 
 
+/*
+https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
+
+I/O: 0x3FF00000..0x3FFC0000
+RAM: 0x3FFE0000..0x40000000   (<50 KB of 80KB available??) stack/heap
+ROM: 0x40000000..0x40100000   (x2)
+IRAM: 0x40100000..0x40140000   32KB, loaded from flash by bootloader
+IROM: 0x40200000..0x40280000   SPI flash
+cfg: 0x60000000..0x60002000
+
+Local Memory     
+XLMI start address / size                                     0x3ff00000 / 256K max 
+Data ROM start address / size                                 0x3ff40000 / 256K
+Data RAM [1] start address / size                             0x3ff80000 / 256K
+Data RAM [0] start address / size                             0x3ffc0000 / 256K
+ESP8285/6: 96KB of DRAM space, ~80KB available to user
+
+Instruction RAM [0] start address / size                      0x40000000 / 1M
+Exception Vectors:
+Level 2 Interrupt Vector (Debug) start address / size         0x40000010 / 0xc
+Level 3 Interrupt Vector (NMI vector) start address / size    0x40000020 / 0xc
+Kernel (Stacked) Exception Vector start address / size        0x40000030 / 0x1c
+User (Program) Exception Vector start address / size          0x40000050 / 0x1c
+Double Exception Vector start address / size                  0x40000070 / 0x10
+Reset                                                         0x40000080
+
+Instruction RAM [1] start address / size                      0x40100000 / 1M
+64K IRAM has one dedicated 32K block of IRAM and two 16K blocks of IRAM. The last two 16K blocks of IRAM can cache flash memory, ICACHE.
+Data access in IRAM or ICACHE must always be a full 32-bit word and aligned.
+
+Instruction ROM start address / size                          0x40200000 / 1M
+
+Reset Vector start address / size                             0x50000000 / 0x300
+
+Memmory-Mapped I/O Registers
+Base      Size	Name	Description
+60000000h	80h	  uart0	UART0 config registers, see examples/IoT_Demo/include/drivers/uart_register.h
+60000100h	100h	spi1	SPI controller registers, see examples/IoT_Demo/include/driver/spi_register.h
+60000200h	100h	spi0	SPI controller registers, see examples/IoT_Demo/include/driver/spi_register.h
+60000300h	74h	  gpio	Timer config registers, see include/eagle_soc.h
+60000600h	28h	  timer	Tmer config registers, see include/eagle_soc.h
+60000700h	A4h	  rtc	  RTC config registers, see include/eagle_soc.h
+60000800h	44h	  iomux	IO MUX config registers, see include/eagle_soc.h
+
+iomux Pin Registers (60000804h–60000843h)
+31    24       16        8        0
+-------- -ffff--- -------- ud--UDEe
+`- Function      ||  |||`- Output Enable
+||  ||`- Output Enable during sleep
+||  |`- Pull-down during sleep
+||  `- Pull-up during sleep
+|`- Pull-down
+`- Pull-up
+
+60000d00h	>=8	  i2c	  I2C controller registers, see ROM functions rom_i2c_readReg, rom_i2c_writeReg
+60000F00h	80h	  uart1	UART1 config registers, see examples/IoT_Demo/include/drivers/uart_register.h
+60001000h	100h	rtcb	RTC backup memory, see rtc_mem_backup
+60001100h	100h	rtcs	RTC system memory, see system_rtc_mem_write
+
+
+https://arduino-esp8266.readthedocs.io/en/latest/mmu.html
+
+Code in IROM runs at 1/4 - 1/12 speed since SPI flash (four data lines) is not nearly as fast as the internal static IRAM.
+Interrupt handlers and code that writes to flash must be run from IRAM.
+
+ICACHE_FLASH_ATTR -> place in IROM
+*/
+
+
 
 // https://richard.burtons.org/2015/05/17/esp8266-boot-process/
 // https://github.com/raburton/esptool2  Windows C
-
-
