@@ -10,10 +10,6 @@
 // platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
 // Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin      Function pointers
 
-const bool doCompact = 0;
-
-#define EspTool "C:\\Users\\Admin\\.platformio\\penv\\Scripts\\esptool --port COM23 --baud 2000000 write_flash 0 "
-
 #include <direct.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,17 +17,35 @@ const bool doCompact = 0;
 #include <windows.h>
 #include <share.h>
 
-bool errorTrace;
+const bool doCompact = 0;
+bool errorTrace = 0;
+
+#define ToolsPath "..\\..\\..\\.platformio\\"
+const char EspTool[] = ToolsPath "penv\\Scripts\\esptool --port COM23 --baud 2000000 write_flash 0 ";
+const char objDump[] = ToolsPath "packages\\toolchain-xtensa\\bin\\xtensa-lx106-elf-objdump.exe";
+// const char objDump[] = ToolsPath "packages\\toolchain-xtensa@2.40802.200502\\bin\\xtensa-lx106-elf-objdump.exe";
+// const char objDump[] = "xtensa-esp32-elf\\bin\\xtensa-esp32-elf-objdump.exe"; // FPU
+// outputs differ - FPU option
+
+const int RAMbase = 0x3FFE8000;
+int ram[80 * 1024 / sizeof(int)];
 
 const int base = 0x40100000;
+const int MaxCodeSize = 6000000;
 int topAddr; // relative to base
+BYTE text[MaxCodeSize];
 
-typedef enum {cnst, io, dram, rom, iram, irom, cfg} Region;
+typedef enum {unk, data, ptr, ill, err, code, instr, l32r, call0, callx0, callxn, ret, branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
+Mark mark[MaxCodeSize];
 
+const int ShownShift = 0;  // min routine 8 bytes
+BYTE shown[MaxCodeSize >> ShownShift];  // better a bit field
+
+typedef enum { cnst, io, dram, rom, iram, irom, cfg } Region;
 Region region(int addr, bool noBase = false) {
   if (!noBase && addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
 
-  switch (addr & 0xFFF00000) {
+  switch (addr & 0xFFF00000) { // could restrict regions further for ESP8285/6
     case 0x3FF00000: return addr >= 0x3FFE0000 ? dram : io;
     case 0x40000000: return rom;
     case 0x40100000: return iram;
@@ -41,17 +55,9 @@ Region region(int addr, bool noBase = false) {
   }
 }
 
-const int MaxCodeSize = 4000000;  // could malloc / compact segments 0x3FFE0000 0x40100000 0x40200000
-
-typedef enum {unk, data, ptr, ill, err, code, other, l32r, call0, callx0, callxn, ret, branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
-
-BYTE text[MaxCodeSize];
-Mark mark[MaxCodeSize];
-
-const int ShownShift = 0;  // min routine 8 bytes
-BYTE shown[MaxCodeSize >> ShownShift];  // better a bit field
-
-// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/app_image_format.html
+BYTE* segBase(int addr) {
+  return region(addr) == iram ? text - base : (BYTE*)ram - RAMbase;
+}
 
 #define ESP_IMAGE_HEADER_MAGIC 0xE9 /*!< magic word for the esp_image_header_t structure. */
 
@@ -94,15 +100,9 @@ struct {
 //offset for 1 Segment = offset for 0 Segment + length of 0 Segment + sizeof(esp_image_segment_header_t).
 //offset for 2 Segment = offset for 1 Segment + length of 1 Segment + sizeof(esp_image_segment_header_t).
 //...
-
 // https://github.com/espressif/esptool/wiki/Firmware-Image-Format
+// https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/app_image_format.html
 
-const int RAMbase = 0x3FFE8000;
-int ram[2048 / sizeof(int)];
-
-BYTE* segBase(int addr) {
-  return region(addr) == iram ? text - base : (BYTE*)ram - RAMbase;
-}
 
 void readBin(const char* binPath) {
   int totalLen = 0;
@@ -206,12 +206,6 @@ int origAddr(int addr) {
   }
   return origAddr;
 }
-
-// outputs differ - FPU option
-const char objDump[] = "C:\\users\\Admin\\.platformio\\packages\\toolchain-xtensa\\bin\\xtensa-lx106-elf-objdump.exe"; 
-// const char objDump[] = "xtensa-esp32-elf\\bin\\xtensa-esp32-elf-objdump.exe"; // FPU
-// const char objDump[] = "C:\\users\\Admin\\.platformio\\packages\\toolchain-xtensa@2.40802.200502\\bin\\xtensa-lx106-elf-objdump.exe";
-// const char objDump[] = "C:\\users\\Admin\\.platformio\\packages\\toolchain-xtensa@1.40802.0\\bin\\xtensa-lx106-elf-objdump.exe";  // 2015
 
 char disasmElfPath[256];
 
@@ -395,20 +389,17 @@ void compact() {
       ++addr;
       continue;
     }
-
-    if (addr == 0x2035)
-      printf(".");  
-
+ 
     int iDispl = displ(addr);
     relo = addr - iDispl; // relocated location
 
+    int dest;
     switch (mark[addr]) {
       case data:
-      case ptr : {
-        int dest = *(int*)(text + addr);
+      case ptr : 
+        dest = *(int*)(text + addr);
         *(int*)(text + relo) = dest - (region(dest, true) == iram ? displ(dest - base) : 0);
         addr += 4;
-        }
         break;
 
       default:
@@ -417,7 +408,6 @@ void compact() {
         if (!narrow)
           text[relo+2] = text[addr+2];        
 
-        int ofs;
         switch (mark[addr + 1]) { 
           case imm6:  // forward offset
             ofs = imm6Dest(addr) - displ(imm6Dest(addr)) - (relo + 4);
@@ -450,15 +440,15 @@ Mark instrType(int addr) {
   if ((op & 0x0F) == 1) return l32r;
   if ((op & 0x3F) == 5) return call0;
   if ((op & 0x3F) == 6) return jmp;
-  if (op == 0x36) return other;  // entry
-  if (op == 0x76) return other;  // lsi
+  if (op == 0x36) return instr;  // entry
+  if (op == 0x76) return instr;  // lsi
   // more??
   if ((op & 0x0E) == 6) return branch;  // (after jmp, entry handled above)
   if ((op & 0x8F) == 0x8C) return branch; // BEQZ.N BNEZ.N
 
-  int instr = *(int*)(text + addr) & 0xFFFFFF;
-  if (instr == 0x80) return ret; // normal encoding
-  if (instr == 0x00) return ill;
+  int instr24 = *(int*)(text + addr) & 0xFFFFFF;
+  if (instr24 == 0x80) return ret; // normal encoding
+  if (instr24 == 0x00) return ill;
 
   int anyReg = instr & 0xFFF0FF;
   if (anyReg == 0x80) return ret;  // in data
@@ -469,13 +459,12 @@ Mark instrType(int addr) {
   if (anyReg == 0xF17010) return ret; // rfdd
   // TODO: more return types!!
 
-
   if ((anyReg & 0xFFFFCF) == 0xC0) return callxn;  // not used
 
   int narrow = instr & 0xFFFF;
   if (narrow == 0xF00D) return ret;  // ret.n
   if (narrow == 0xF06D) return ill;
-  return other;
+  return instr;
 }
 
 void onError(int addr, const char* type) {
@@ -574,7 +563,7 @@ int traverse(int addr) {  // returns fail addr
     int failedAt = 0;
 
     switch (mark[addr]) {
-      case other : break;
+      case instr : break;
       case l32r:
         dest = l32rDest(addr);
         if (region(dest) == iram) {
@@ -781,8 +770,7 @@ int main(int argc, char** argv) {
   if (markedOrig == markedShrink) {
     strcat(binPath, ".shrink.bin");
     writeBin(binPath);
-    char espCmd[512] = EspTool;
-    strcat(espCmd, binPath);
+    char espCmd[512]; strcpy(espCmd, EspTool); strcat(espCmd, binPath);
     system(espCmd);
   }
 }
