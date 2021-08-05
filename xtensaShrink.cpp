@@ -450,7 +450,7 @@ Mark instrType(int addr) {
   if (instr24 == 0x80) return ret; // normal encoding
   if (instr24 == 0x00) return ill;
 
-  int anyReg = instr & 0xFFF0FF;
+  int anyReg = instr24 & 0xFFF0FF;
   if (anyReg == 0x80) return ret;  // in data
   if (anyReg == 0xA0) return jx;
   if (anyReg == 0xC0) return callx0;
@@ -461,9 +461,9 @@ Mark instrType(int addr) {
 
   if ((anyReg & 0xFFFFCF) == 0xC0) return callxn;  // not used
 
-  int narrow = instr & 0xFFFF;
-  if (narrow == 0xF00D) return ret;  // ret.n
-  if (narrow == 0xF06D) return ill;
+  int instr16 = instr24 & 0xFFFF;
+  if (instr16 == 0xF00D) return ret;  // ret.n
+  if (instr16 == 0xF06D) return ill;
   return instr;
 }
 
@@ -616,12 +616,11 @@ int traverse(int addr) {  // returns fail addr
       #if 1
         {
           int switchTbl = 0;
-          // TODO: other possibile intervening instructions ****
           if (instrType(addr-8) == l32r) 
             switchTbl = l32rDest(addr - 8); 
           else if (instrType(addr-13) == l32r) 
             switchTbl = l32rDest(addr - 13); 
-                    
+          if (!switchTbl) printf("%X add l32r to jx ofs!\n", base + addr);  // TODO: other possible intervening code: scan back for l32r ****                    
           // table of jmps: 3 bytes per entry
           if (region(switchTbl) == iram) while (1) {
             int iType = instrType(switchTbl);
@@ -630,7 +629,7 @@ int traverse(int addr) {  // returns fail addr
             if ((failedAt = traverse(switchTbl))) {
               onError(addr, dest, failedAt, "jx tbl");
               return addr;
-            }  
+            } 
             switchTbl += 3;      
           }
           return 0;
@@ -767,7 +766,7 @@ int main(int argc, char** argv) {
 
   cleanDisasm();
 
-  if (markedOrig == markedShrink) {
+  if (doCompact && markedOrig == markedShrink) {
     strcat(binPath, ".shrink.bin");
     writeBin(binPath);
     char espCmd[512]; strcpy(espCmd, EspTool); strcat(espCmd, binPath);
