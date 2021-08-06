@@ -4,11 +4,11 @@
 
 // data arrays: look for addr + ofs code 
 
-// no use of LITBASE for L32R with Special Reg 5
+// no use of LITBASE for L32R with Special Reg 5?
 // build firmware with VTABLES_IN_ROM 
 
 // platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
-// Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin      Function pointers
+// Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin     (has function pointers -- should be traversed)
 
 #include <direct.h>
 #include <stdlib.h>
@@ -17,31 +17,34 @@
 #include <windows.h>
 #include <share.h>
 
-const bool doCompact = 0;
-bool errorTrace = 0;
-
 #define ToolsPath "..\\..\\..\\.platformio\\"
-const char EspTool[] = ToolsPath "penv\\Scripts\\esptool --port COM23 --baud 2000000 write_flash 0 ";
+#define COMport  "COM6" // nodemcu
+
+const char EspTool[] = ToolsPath "penv\\Scripts\\esptool --port " COMport " --baud 2000000 write_flash 0 ";
 const char objDump[] = ToolsPath "packages\\toolchain-xtensa\\bin\\xtensa-lx106-elf-objdump.exe";
 // const char objDump[] = ToolsPath "packages\\toolchain-xtensa@2.40802.200502\\bin\\xtensa-lx106-elf-objdump.exe";
 // const char objDump[] = "xtensa-esp32-elf\\bin\\xtensa-esp32-elf-objdump.exe"; // FPU
 // outputs differ - FPU option
 
-const int RAMbase = 0x3FFE8000;
-int ram[80 * 1024 / sizeof(int)];
+const bool doCompact = 1;
+bool errorTrace = 0;
 
-const int base = 0x40100000;
+const int RAMbase = 0x3FFE8000;
+int ram[96 * 1024 / sizeof(int)];
+
+const int base = 0x40100000;  // iram
 const int MaxCodeSize = 6000000;
 int topAddr; // relative to base
 BYTE text[MaxCodeSize];
 
-typedef enum {unk, data, ptr, ill, err, code, instr, l32r, call0, callx0, callxn, ret, branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
+typedef enum {unk, data, ptr, ill, err, code, instr, l32r, call0, callx0, callxn, ret, 
+              branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
 Mark mark[MaxCodeSize];
 
 const int ShownShift = 0;  // min routine 8 bytes
 BYTE shown[MaxCodeSize >> ShownShift];  // better a bit field
 
-typedef enum { cnst, io, dram, rom, iram, irom, cfg } Region;
+typedef enum { cnst, io, dram, rom, iram, irom, config } Region;
 Region region(int addr, bool noBase = false) {
   if (!noBase && addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
 
@@ -50,12 +53,12 @@ Region region(int addr, bool noBase = false) {
     case 0x40000000: return rom;
     case 0x40100000: return iram;
     case 0x40200000: return irom;
-    case 0x60000000: return cfg;
-    default: return cnst; // const
+    case 0x60000000: return config;  // radio Vdd, Tx power, ...
+    default: return cnst; // const, not an address
   }
 }
 
-BYTE* segBase(int addr) {
+BYTE* regionBase(int addr) {
   return region(addr) == iram ? text - base : (BYTE*)ram - RAMbase;
 }
 
@@ -131,7 +134,7 @@ void readBin(const char* binPath) {
       }
 
       int ofs = esp_image_segment_header[i].load_addr;
-      fread(segBase(ofs) + ofs, 1, esp_image_segment_header[i].data_len, bin);
+      fread(regionBase(ofs) + ofs, 1, esp_image_segment_header[i].data_len, bin);
     }
 
     int fPos = ftell(bin);
@@ -173,7 +176,7 @@ void writeBin(const char* binPath) {
   for (int i = 0; i < esp_image_header.segment_count; ++i) {
     fwrite(&esp_image_segment_header[i], sizeof(esp_image_segment_header[0]), 1, bin);
     int ofs = esp_image_segment_header[i].load_addr;
-    writeAndSum(segBase(ofs) + ofs, esp_image_segment_header[i].data_len, bin);
+    writeAndSum(regionBase(ofs) + ofs, esp_image_segment_header[i].data_len, bin);
   }
 
   int fill = 15 - ftell(bin) % 16;
@@ -191,7 +194,6 @@ int displ(int addr) { // compaction displacement
   }
   return mapOfs[addr >> 2] << 2;
 }
-
 
 int origAddr(int addr) {
   static int origAddr;
@@ -227,14 +229,15 @@ void doDisasm(int startAddr, int stopAddr) {
   }
 
   sprintf_s(disasmCmd, sizeof(disasmCmd), 
-            "%s -d --start-address=0x%X --stop-address=0x%X %s >> disasm.txt", objDump, base + startAddr, base + stopAddr, disasmElfPath);
+            "%s -d --start-address=0x%X --stop-address=0x%X %s >> disasm.txt", 
+             objDump, base + startAddr, base + stopAddr, disasmElfPath);
   system(disasmCmd);
   system("echo . >> disasm.txt");  // separator 
 }
 
 void disasmAt(int startAddr, int stopAddr = 0) {
   if (startAddr > 0x30000000) startAddr -= base;
-  if (stopAddr > 0x30000000) stopAddr -= base;
+  if (stopAddr  > 0x30000000) stopAddr -= base;
   if (!stopAddr) stopAddr = startAddr + 32;
 
   //if (shown[startAddr >> ShownShift]) return;
@@ -297,7 +300,7 @@ void cleanDisasm() {
     } else if (l[0] > ' ' && l[0] != 'D' && l[0] != 'p' && l[0] != 'T')
       fputs(l, clean);
 
-    if (strstr(l, ", f")) fputs("                      NO FPU !!           ^^^\n", clean);
+    if (strstr(l, ", f")) fputs("                      ?? FPU ??           ^^^\n", clean);
   }
 
   fclose(clean);
@@ -412,7 +415,7 @@ void compact() {
           case imm6:  // forward offset
             ofs = imm6Dest(addr) - displ(imm6Dest(addr)) - (relo + 4);
             text[relo] = text[relo] & 0xCF | ofs & 0x30;  // MS 2 bits
-            text[relo+1] = text[relo + 1] & 0x0F | (ofs & 0xF) << 4; // LS nibble -> MS nibble
+            text[relo+1] = text[relo + 1] & 0x0F | (ofs & 0xF) << 4; // LS nibble -> MS nibble!
             break; 
           case imm8: text[relo+2] += iDispl - displ(imm8Dest(addr)); break; // signed
           case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; 
@@ -476,8 +479,6 @@ void onError(int addr, const char* type) {
   for (int i = 4; i--;)
     stopAddr += text[stopAddr] & 0x8 ? 2 : 3;
 
-  // mark[addr] = err;
-
   printf("%6s @ %X(%X)\n", type, base + addr, base + origAddr(addr));
   disasmAt(addr, stopAddr);
 }
@@ -512,14 +513,14 @@ void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
 }
 
 
-int routineAt(int start, int stop = 0) {
+int inCodeRegion(int start, int stop = 0) { // returns error address if not code region
   switch (region(start)) {
     case iram:
     case irom:
     case rom : return 0;
   }
 
-  return start;
+  return start; // not code region
 
   start &= 0xFFFFFFFC;
   int retPos = start;
@@ -567,7 +568,7 @@ int traverse(int addr) {  // returns fail addr
       case l32r:
         dest = l32rDest(addr);
         if (region(dest) == iram) {
-          if ((failedAt = traverse(dest))) { // fn ptr, ...
+          if ((failedAt = traverse(dest))) {
             onError(addr, dest, failedAt, "l32r");
             return addr;
           }
@@ -576,7 +577,7 @@ int traverse(int addr) {  // returns fail addr
 
       case call0: 
         dest = call0Dest(addr);
-        if (routineAt(dest)) {
+        if (inCodeRegion(dest)) {
           onError(addr, dest, addr, "call0 oob");
           return addr;
         }
@@ -590,8 +591,8 @@ int traverse(int addr) {  // returns fail addr
       case callx0:  
         if ((text[addr - 3] & 0xF) == 1
          && (text[addr - 3] & 0xF0) >> 4 == (text[addr + 1] & 0xF)) { // l32r same register
-          dest = l32rDest(addr - 3);  // indirect   // ? intervening instructions possible?
-          if (routineAt(dest)) {
+          dest = l32rDest(addr - 3);  // indirect 
+          if (inCodeRegion(dest)) {
             onError(addr - 3, dest, l32rDest(addr - 3), "callx0 oob");
             return errorTrace ? addr : 0;  
           }
@@ -600,7 +601,10 @@ int traverse(int addr) {  // returns fail addr
             onError(addr, dest, failedAt, "callx0");
             return addr;
           }
-        } // else printf("%X: callx0 well after l32r\n", base + addr); // OK - could keep track of registers
+        } else printf("%X: callx0 well after l32r\n", base + addr); 
+              // TODO: typ. double indirection?; 
+              //  typ. already traversed at l32r 
+              //  could keep track of register values, watch for added offsets, ...
         break;
       case ret: return 0;
 
@@ -612,17 +616,17 @@ int traverse(int addr) {  // returns fail addr
         }
         break;
 
-      case jx: 
-      #if 1
-        {
-          int switchTbl = 0;
-          if (instrType(addr-8) == l32r) 
-            switchTbl = l32rDest(addr - 8); 
-          else if (instrType(addr-13) == l32r) 
-            switchTbl = l32rDest(addr - 13); 
-          if (!switchTbl) printf("%X add l32r to jx ofs!\n", base + addr);  // TODO: other possible intervening code: scan back for l32r ****                    
-          // table of jmps: 3 bytes per entry
-          if (region(switchTbl) == iram) while (1) {
+      case jx: {
+        int switchTbl = 0;
+        if (instrType(addr-8) == l32r) 
+          switchTbl = l32rDest(addr - 8); 
+        else if (instrType(addr-13) == l32r) 
+          switchTbl = l32rDest(addr - 13); 
+        if (!switchTbl) printf("%X add l32r to jx ofs!\n", base + addr);  // TODO: other possible intervening code: scan back for l32r ****    
+
+        // table of jmps: 3 bytes per entry
+        if (region(switchTbl) == iram) 
+          while (1) {
             int iType = instrType(switchTbl);
             if (iType < call0 || iType > jx) return 0;
             // printf("s%X ", base + switchTbl);
@@ -633,11 +637,7 @@ int traverse(int addr) {  // returns fail addr
             switchTbl += 3;      
           }
           return 0;
-        } 
-      #else
-        onError(-base, addr - 8, addr, "jx");  return 0;  // errorTrace more context before jx   jmp to base + at * 3  (jx instrs)
-      #endif
-        break;
+        } break;
 
       case jmp:
         if (text[addr] == 0xA0) { // jx <reg>
@@ -652,9 +652,8 @@ int traverse(int addr) {  // returns fail addr
         onError(addr, "ill");
         return errorTrace ? addr : 0;
 
-      default: onError(addr, "mark"); return addr;
+      default: onError(addr, "mark"); return addr;  // should never happen
     }
-
     addr += narrow ? 2 : 3;
   }
   return 0;
@@ -780,7 +779,7 @@ Flashed to 4096 byte sectors according to partition table
 Compressed 196136 bytes to 144322...  
 Writing at 0x00010000... (11 %)
 Writing at 0x00030000... (100 %)
-Wrote 196136 bytes (144322 compressed) at 0x00010000 in 1.6 seconds (effective 990.7 kbit/s)...     irom0text.bin  (once - no magic E9)
+Wrote 196136 bytes (144322 compressed) at 0x00010000 in 1.6 seconds (effective 990.7 kbit/s)...  irom0text.bin  (once)
 
 Compressed 128 bytes to 75...
 Writing at 0x003fc000... (100 %)
@@ -797,7 +796,6 @@ Wrote 26464 bytes (19810 compressed) at 0x00000000 in 0.2 seconds (effective 132
 */
 
 
-
 /*
 https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
 
@@ -806,7 +804,7 @@ RAM: 0x3FFE0000..0x40000000   (<50 KB of 80KB available??) stack/heap
 ROM: 0x40000000..0x40100000   (x2)
 IRAM: 0x40100000..0x40140000   32KB, loaded from flash by bootloader
 IROM: 0x40200000..0x40280000   SPI flash
-cfg: 0x60000000..0x60002000
+config: 0x60000000..0x60002000
 
 Local Memory     
 XLMI start address / size                                     0x3ff00000 / 256K max 
@@ -845,18 +843,17 @@ Base      Size	Name	Description
 iomux Pin Registers (60000804h–60000843h)
 31    24       16        8        0
 -------- -ffff--- -------- ud--UDEe
-`- Function      ||  |||`- Output Enable
-||  ||`- Output Enable during sleep
-||  |`- Pull-down during sleep
-||  `- Pull-up during sleep
-|`- Pull-down
-`- Pull-up
+          `- Function      ||  |||`- Output Enable
+                           ||  ||`- Output Enable during sleep
+                           ||  |`- Pull-down during sleep
+                           ||  `- Pull-up during sleep
+                           |`- Pull-down
+                            `- Pull-up
 
 60000d00h	>=8	  i2c	  I2C controller registers, see ROM functions rom_i2c_readReg, rom_i2c_writeReg
 60000F00h	80h	  uart1	UART1 config registers, see examples/IoT_Demo/include/drivers/uart_register.h
 60001000h	100h	rtcb	RTC backup memory, see rtc_mem_backup
 60001100h	100h	rtcs	RTC system memory, see system_rtc_mem_write
-
 
 https://arduino-esp8266.readthedocs.io/en/latest/mmu.html
 
