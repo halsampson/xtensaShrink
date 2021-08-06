@@ -2,6 +2,9 @@
 
 // Blinky first
 
+// TODO: check for any calls from irom to iram (would need offsets)
+
+// TODO: optional doNotFollow list for strtod, printf double, ... other bloat; stub
 // data arrays: look for addr + ofs code 
 
 // no use of LITBASE for L32R with Special Reg 5?
