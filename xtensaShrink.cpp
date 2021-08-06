@@ -27,6 +27,7 @@ const char objDump[] = ToolsPath "packages\\toolchain-xtensa\\bin\\xtensa-lx106-
 // outputs differ - FPU option
 
 const bool doCompact = 1;
+const bool doFlash = doCompact;
 bool errorTrace = 0;
 
 const int RAMbase = 0x3FFE8000;
@@ -186,27 +187,23 @@ void writeBin(const char* binPath) {
   fclose(bin);
 }
 
-unsigned short mapOfs[MaxCodeSize >> 2]; // compaction offset >> 2
+unsigned short mapToDispl[MaxCodeSize >> 2]; // compaction displacement >> 2
+unsigned short mapFromDispl[MaxCodeSize >> 2]; // inverse for comparing disasm
+// up to 256KB compaction - else use ints
 
 int displ(int addr) { // compaction displacement
   if (region(base + addr, true) != iram) {  // call to library
     return 0;
   }
-  return mapOfs[addr >> 2] << 2;
+  return mapToDispl[addr >> 2] << 2;
 }
 
-int origAddr(int addr) {
-  static int origAddr;
-  int lsBits = addr & 3;
-  addr &= ~3;
-  while (1) {
-    int ofs = addr - (origAddr - displ(origAddr));
-    if (ofs == 0) return origAddr | lsBits;
-    if ( ofs >= 4) origAddr += 4;
-    else if (ofs <= -4) origAddr -= 4;    
-    // better faster convergence!!
-  }
-  return origAddr;
+int packedAddr(int addr) {
+  return addr - displ(addr);
+}
+
+int origAddr(int addr) { // for disasm
+  return addr + (mapFromDispl[addr >> 2] << 2);
 }
 
 char disasmElfPath[256];
@@ -372,17 +369,19 @@ void addrAt(int addr) {
   printf("%X:%X %d\n", addr, *(int*)(text + addr - base), mark[addr - base]);
 }
 
-void compact() {
+void compact() { 
   // find holes for compacted displacement mapping:
   int ofs = 0;
   int addr;
   Mark lastMark = code;
   for (addr = first; addr <= last; addr += 4) {
-    mapOfs[addr >> 2] = ofs;
+    mapToDispl[addr >> 2] = ofs;
+    mapFromDispl[(addr >> 2) - ofs] = ofs;
     if (mark[addr]) lastMark = mark[addr];
-    if (addr > 0x90 && lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3])
-      ++ofs; // hole; interrupt vectors don't move!
-    // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
+    if (addr > 0x90 // interrupt vectors don't move!
+    && lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3]) { // unused hole
+      ++ofs;
+    } // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
 
   int relo = first;
@@ -757,7 +756,7 @@ int main(int argc, char** argv) {
 
   copyToElf(first, last - first + 1);
   errorTrace = true;
-  traverse(esp_image_header.entry_addr - base - displ(esp_image_header.entry_addr - base));
+  traverse(packedAddr(esp_image_header.entry_addr - base));
   markIntrs();
   traversed = true;
   int markedShrink = countMarked();
@@ -765,7 +764,7 @@ int main(int argc, char** argv) {
 
   cleanDisasm();
 
-  if (doCompact && markedOrig == markedShrink) {
+  if (doFlash && markedOrig == markedShrink) {
     strcat(binPath, ".shrink.bin");
     writeBin(binPath);
     char espCmd[512]; strcpy(espCmd, EspTool); strcat(espCmd, binPath);
