@@ -2,7 +2,8 @@
 
 // Blinky first
 
-// TODO: check for any calls from irom to iram (would need offsets)
+// TODO: handle irom region
+// TODO: follow, check for any refs from irom to iram (would need offsets)
 
 // TODO: optional doNotFollow list for strtod, printf double, ... other bloat; stub
 // data arrays: look for addr + ofs code 
@@ -10,7 +11,10 @@
 // no use of LITBASE for L32R with Special Reg 5?
 // build firmware with VTABLES_IN_ROM 
 
-// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin     Blinky
+//Blinky
+// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin         
+//                                                                                      firmware.bin.irom0text.bin
+
 // Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin     (has function pointers -- should be traversed)
 
 #include <direct.h>
@@ -30,40 +34,40 @@ const char objDump[] = ToolsPath "packages\\toolchain-xtensa\\bin\\xtensa-lx106-
 // outputs differ - FPU option
 
 const bool doCompact = 1;
-const bool doFlash = doCompact;
+const bool doFlash = 0; // doCompact;
+const bool doDisasm = 0;  // diagnostic output
 bool errorTrace = 0;
 
-const int RAMbase = 0x3FFE8000;
-int ram[96 * 1024 / sizeof(int)];
+const int dramBase = 0x3FFE8000;
+const int iramBase = 0x40100000;
+const int MaxAddr = 0x40300000;
 
-const int base = 0x40100000;  // iram
-const int MaxCodeSize = 6000000;
-int topAddr; // relative to base
-BYTE text[MaxCodeSize];
+const int MinAddr = dramBase;
+const int MaxCodeSize = MaxAddr - MinAddr;
 
-typedef enum {unk, data, ptr, ill, err, code, instr, l32r, call0, callx0, callxn, ret, 
+int topAddr;
+BYTE textA[MaxCodeSize];
+BYTE* text = textA - MinAddr;
+
+typedef enum : unsigned char {unk, data, ptr, ill, err, code, instr, l32r, call0, callx0, callxn, ret,
               branch, jmp, jx, code1, code2, imm6, imm8, imm12, imm16, imm18, imm20} Mark;
-Mark mark[MaxCodeSize];
+Mark markA[MaxCodeSize];
+Mark* mark = markA - MinAddr;
 
 const int ShownShift = 0;  // min routine 8 bytes
-BYTE shown[MaxCodeSize >> ShownShift];  // better a bit field
+BYTE shownA[MaxCodeSize >> ShownShift];  // better a bit field
+BYTE* shown = shownA - MinAddr;
 
 typedef enum { cnst, io, dram, rom, iram, irom, config } Region;
-Region region(int addr, bool noBase = false) {
-  if (!noBase && addr >= -(0x100000) && addr < 0x180000) addr += base;  // imm18 -> 19 bits into irom
-
-  switch (addr & 0xFFF00000) { // could restrict regions further for ESP8285/6
+Region region(int addr) {
+   switch (addr & 0xFFF00000) { // could restrict regions further for ESP8285/6
     case 0x3FF00000: return addr >= 0x3FFE0000 ? dram : io;
     case 0x40000000: return rom;
-    case 0x40100000: return iram;
+    case iramBase: return iram;
     case 0x40200000: return irom;
     case 0x60000000: return config;  // radio Vdd, Tx power, ...
     default: return cnst; // const, not an address
   }
-}
-
-BYTE* regionBase(int addr) {
-  return region(addr) == iram ? text - base : (BYTE*)ram - RAMbase;
 }
 
 #define ESP_IMAGE_HEADER_MAGIC 0xE9 /*!< magic word for the esp_image_header_t structure. */
@@ -131,14 +135,14 @@ void readBin(const char* binPath) {
       totalLen += esp_image_segment_header[i].data_len;
       if (endAddr > topAddr) {
         topAddr = endAddr;
-        if (topAddr > base + MaxCodeSize) {
+        if (topAddr > MaxAddr) {
           printf("increase MaxCodeSize\n");
           exit(9);
         }
       }
 
       int ofs = esp_image_segment_header[i].load_addr;
-      fread(regionBase(ofs) + ofs, 1, esp_image_segment_header[i].data_len, bin);
+      fread(text + ofs, 1, esp_image_segment_header[i].data_len, bin);
     }
 
     int fPos = ftell(bin);
@@ -149,7 +153,6 @@ void readBin(const char* binPath) {
     if (fseek(bin, fPos, SEEK_SET)) break;
   }
 
-  topAddr -= base;
   fclose(bin);
 
   printf("\t\t\t  Total len %6d\n\n", totalLen);
@@ -170,7 +173,7 @@ void writeBin(const char* binPath) {
   FILE* bin = fopen(binPath, "wb");
 
 #if 0
-  esp_image_segment_header[0].load_addr = (base + first + 3) & 0xFFFFFFFC;
+  esp_image_segment_header[0].load_addr = (first + 3) & 0xFFFFFFFC;
   esp_image_segment_header[0].data_len =  (last + 1 - first + 3) & 0xFFFFFFFC;
   // esp_image_header.segment_count = 1; // DRAM content - for loader??
 #endif
@@ -180,7 +183,7 @@ void writeBin(const char* binPath) {
   for (int i = 0; i < esp_image_header.segment_count; ++i) {
     fwrite(&esp_image_segment_header[i], sizeof(esp_image_segment_header[0]), 1, bin);
     int ofs = esp_image_segment_header[i].load_addr;
-    writeAndSum(regionBase(ofs) + ofs, esp_image_segment_header[i].data_len, bin);
+    writeAndSum(text + ofs, esp_image_segment_header[i].data_len, bin);
   }
 
   int fill = 15 - ftell(bin) % 16;
@@ -190,12 +193,14 @@ void writeBin(const char* binPath) {
   fclose(bin);
 }
 
-unsigned short mapToDispl[MaxCodeSize >> 2]; // compaction displacement >> 2
-unsigned short mapFromDispl[MaxCodeSize >> 2]; // inverse for comparing disasm
-// up to 256KB compaction - else use ints
+int mapToDisplA[MaxCodeSize >> 2]; // compaction displacement >> 2
+int mapFromDisplA[MaxCodeSize >> 2]; // inverse for comparing disasm
+
+int* mapToDispl = mapToDisplA - (MinAddr >> 2);
+int* mapFromDispl = mapFromDisplA - (MinAddr >> 2);
 
 int displ(int addr) { // compaction displacement
-  if (region(base + addr, true) != iram) {  // call to library
+  if (region(addr) != iram) {  // call to library
     return 0;
   }
   return mapToDispl[addr >> 2] << 2;
@@ -221,37 +226,36 @@ void disasmAt(const char* symbol) {
 
 bool traversed, shrunk;
 
-void doDisasm(int startAddr, int stopAddr) {
+void disasmCode(int startAddr, int stopAddr) {
+  if (!doDisasm) return;
+
   char disasmCmd[512];
   if (shrunk) {
-    sprintf_s(disasmCmd, sizeof(disasmCmd), "echo (%X): >> disasm.txt", base + origAddr(startAddr));
+    sprintf_s(disasmCmd, sizeof(disasmCmd), "echo (%X): >> disasm.txt", origAddr(startAddr));
     system(disasmCmd);
   }
-
   sprintf_s(disasmCmd, sizeof(disasmCmd), 
             "%s -d --start-address=0x%X --stop-address=0x%X %s >> disasm.txt", 
-             objDump, base + startAddr, base + stopAddr, disasmElfPath);
+             objDump, startAddr, stopAddr, disasmElfPath);
   system(disasmCmd);
   system("echo . >> disasm.txt");  // separator 
 }
 
 void disasmAt(int startAddr, int stopAddr = 0) {
-  if (startAddr > 0x30000000) startAddr -= base;
-  if (stopAddr  > 0x30000000) stopAddr -= base;
   if (!stopAddr) stopAddr = startAddr + 32;
 
   //if (shown[startAddr >> ShownShift]) return;
   shown[startAddr >> ShownShift] = 1;
 
   if (!traversed) {
-    doDisasm(startAddr, stopAddr);
+    disasmCode(startAddr, stopAddr);
     return;
   }
 
   int blockEnd = startAddr;
   do {
     char hex[64 * 3] = "echo ";  // command line limit
-    _itoa(base + startAddr, hex + 5, 16); 
+    _itoa(startAddr, hex + 5, 16); 
     hex[5 + 8] = ':';
     char* pHex = hex + 5 + 8 + 1;
     while (mark[blockEnd] < code && blockEnd < stopAddr) { // errorTrace data
@@ -269,13 +273,15 @@ void disasmAt(int startAddr, int stopAddr = 0) {
     startAddr = blockEnd;
 
     while (mark[blockEnd] >= code && blockEnd < stopAddr) ++blockEnd;
-    doDisasm(startAddr, blockEnd);
+    disasmCode(startAddr, blockEnd);
     startAddr = blockEnd;
 
   } while (blockEnd < stopAddr);
 }
 
 void cleanDisasm() {
+  if (!doDisasm) return;
+
   FILE* disasm = _fsopen("disasm.txt", "rt", _SH_DENYNO);
   if (!disasm) exit(6);
 
@@ -289,8 +295,8 @@ void cleanDisasm() {
       if (l32rPos && *(l32rPos + 9 + 8) != ':') {
         int ref;
         sscanf(l32rPos + 9, "%X", &ref);
-        if (region(ref, true) == iram) {
-          int load = *(int*)(text + ref - base);
+        if (region(ref) == iram) {
+          int load = *(int*)(text + ref);
           *(l32rPos + 9 + 8) = ':';
           _itoa(load, l32rPos + 9 + 9, 16);
           strcat(l, "\n");
@@ -358,18 +364,17 @@ int l32rDest(int addr) {
   mark[addr + 1] = imm16;
   int dest = imm16Dest(addr);
   if (dest < 0) {
-    printf("%X:%X l32r ref ??\n", base + addr, base + dest); 
+    printf("%X:%X l32r ref ??\n", addr, dest); 
     return dest;
   }
   mark[dest] = ptr; // TODO: plus maybe more following in array
 
   int target = *(int*)(text + dest);
-  return target - base;  // indirect
+  return target;  // indirect
 }
 
 void addrAt(int addr) {
-  if (addr < base) addr += base;
-  printf("%X:%X %d\n", addr, *(int*)(text + addr - base), mark[addr - base]);
+  printf("%X:%X %d\n", addr, *(int*)(text + addr), mark[addr]);
 }
 
 void compact() { 
@@ -403,7 +408,7 @@ void compact() {
       case data:
       case ptr : 
         dest = *(int*)(text + addr);
-        *(int*)(text + relo) = dest - (region(dest, true) == iram ? displ(dest - base) : 0);
+        *(int*)(text + relo) = dest - (region(dest) == iram ? displ(dest) : 0);
         addr += 4;
         break;
 
@@ -435,8 +440,8 @@ void compact() {
 
   traversed = false;
   shrunk = true;
-  memset(mark, unk, sizeof(mark));  // or move marks
-  memset(shown, 0, sizeof(shown));
+  memset(markA, unk, sizeof(markA));  // or move marks
+  memset(shownA, 0, sizeof(shownA));
 }
 
 Mark instrType(int addr) { 
@@ -481,14 +486,14 @@ void onError(int addr, const char* type) {
   for (int i = 4; i--;)
     stopAddr += text[stopAddr] & 0x8 ? 2 : 3;
 
-  printf("%6s @ %X(%X)\n", type, base + addr, base + origAddr(addr));
+  printf("%6s @ %X(%X)\n", type, addr, origAddr(addr));
   disasmAt(addr, stopAddr);
 }
 
 void onError(int addr, int dest, int failedAt, const char* type) {
   char cmd[128];
-  int orig = base + origAddr(addr);
-  sprintf_s(cmd, sizeof(cmd), "echo %s @ %X(%X) to %X..%X >> disasm.txt", type, addr + base, orig, dest + base, failedAt + base);
+  int orig = origAddr(addr);
+  sprintf_s(cmd, sizeof(cmd), "echo %s @ %X(%X) to %X..%X >> disasm.txt", type, addr, orig, dest, failedAt);
   system(cmd);
 
   if (dest >= 0 && failedAt >= dest) {
@@ -497,7 +502,7 @@ void onError(int addr, int dest, int failedAt, const char* type) {
     disasmAt(dest, failedAt);
   } else disasmAt(addr);
 
-  printf("%6s @ %X(%X)->%X..%X\n", type, base + addr, orig, base + dest, base + failedAt);
+  printf("%6s @ %X(%X)->%X..%X\n", type, addr, orig, dest, failedAt);
 }
 
 void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
@@ -603,7 +608,7 @@ int traverse(int addr) {  // returns fail addr
             onError(addr, dest, failedAt, "callx0");
             return addr;
           }
-        } else printf("%X: callx0 well after l32r\n", base + addr); 
+        } else printf("%X: callx0 well after l32r\n", addr); 
               // TODO: typ. double indirection?; 
               //  typ. already traversed at l32r 
               //  could keep track of register values, watch for added offsets, ...
@@ -624,14 +629,14 @@ int traverse(int addr) {  // returns fail addr
           switchTbl = l32rDest(addr - 8); 
         else if (instrType(addr-13) == l32r) 
           switchTbl = l32rDest(addr - 13); 
-        if (!switchTbl) printf("%X add l32r to jx ofs!\n", base + addr);  // TODO: other possible intervening code: scan back for l32r ****    
+        if (!switchTbl) printf("%X add l32r to jx ofs!\n", addr);  // TODO: other possible intervening code: scan back for l32r ****    
 
         // table of jmps: 3 bytes per entry
         if (region(switchTbl) == iram) 
           while (1) {
             int iType = instrType(switchTbl);
             if (iType < call0 || iType > jx) return 0;
-            // printf("s%X ", base + switchTbl);
+            // printf("s%X ", switchTbl);
             if ((failedAt = traverse(switchTbl))) {
               onError(addr, dest, failedAt, "jx tbl");
               return addr;
@@ -688,32 +693,23 @@ void copyToElf(int start = 0, int len = 0) {  // only for objdump disasm!!
 
 int countMarked() {
   int marked = 0;
-  for (int addr = 0; addr < topAddr; addr += 4)
+  for (int addr = MinAddr; addr < topAddr; addr += 4)
     if (mark[addr]) {
       if (!marked) {
         first = addr;
-        printf("\nFirst %X\n", base+first);
+        printf("\nFirst %X\n", first);
       }
       marked += 4;
       last = addr;
     }
   last += 2; // ret
-  printf("Last  %X\n", base + last);
+  printf("Last  %X\n", last);
   printf("%d bytes marked\n\n", marked);
   return marked;
 }
 
-void reloRam() {
-  for (int a = 0; a < sizeof(ram) / sizeof(ram[0]); ++a) {
-    if (region(ram[a], true) == iram) {
-      printf("ram %X:%X\n", RAMbase + a, ram[a]);
-      ram[a] -= displ(ram[a]);
-    }
-  }
-}
-
 void markIntrs() {
-  for (int vect = 0x10; vect <= 0x80; vect += 0x10)   // relocated via wsr.vecbase 0x40100000
+  for (int vect = iramBase + 0x10; vect <= iramBase + 0x80; vect += 0x10)   // relocated via wsr.vecbase 0x40100000
     if (*(int*)(text + vect)) 
       traverse(vect);
   // else printf("Vect %X no code\n", vect);
@@ -737,7 +733,7 @@ int main(int argc, char** argv) {
   copyToElf();
 
   int failedAt;
-  if ((failedAt = traverse(esp_image_header.entry_addr - base)))
+  if ((failedAt = traverse(esp_image_header.entry_addr)))
     onError(failedAt, "top");
 
   markIntrs();
@@ -754,12 +750,11 @@ int main(int argc, char** argv) {
 
   if (doCompact) {
     compact();
-    reloRam();
   }
 
   copyToElf(first, last - first + 1);
   errorTrace = true;
-  traverse(packedAddr(esp_image_header.entry_addr - base));
+  traverse(packedAddr(esp_image_header.entry_addr));
   markIntrs();
   traversed = true;
   int markedShrink = countMarked();
