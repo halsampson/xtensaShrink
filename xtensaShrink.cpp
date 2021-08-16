@@ -12,8 +12,11 @@
 // build firmware with VTABLES_IN_ROM 
 
 //Blinky
-// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin         
-//                                                                                      firmware.bin.irom0text.bin
+// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin
+// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin.irom0text.bin 
+     // irom0text.bin is code from the static libraries located in \lib -- loaded with offset 0x40000 (blocks?)
+     // 400018A4 400018B4 ...
+     // lots of 4010xxxx refs to fix!!
 
 // Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin     (has function pointers -- should be traversed)
 
@@ -36,10 +39,11 @@ const char objDump[] = ToolsPath "packages\\toolchain-xtensa\\bin\\xtensa-lx106-
 const bool doCompact = 1;
 const bool doFlash = 0; // doCompact;
 const bool doDisasm = 0;  // diagnostic output
-bool errorTrace = 0;
+bool errorTrace = 1;
 
 const int dramBase = 0x3FFE8000;
 const int iramBase = 0x40100000;
+const int _irom0_text_start = 0x40210000;
 const int MaxAddr = 0x40300000;
 
 const int MinAddr = dramBase;
@@ -115,13 +119,32 @@ struct {
 // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/app_image_format.html
 
 
+void readIrom(const char* binPath) {
+  char iromPath[256];
+  strcpy(iromPath, binPath);
+  strcat(iromPath, ".irom0text.bin");
+
+  FILE* bin = fopen(iromPath, "rb");
+  if (!bin) return;
+  int len = (int)fread(text + _irom0_text_start, 1, 0x100000, bin);
+  topAddr = _irom0_text_start + len;
+  printf("irom len %d\n", len);
+  fclose(bin);
+}
+
+
 void readBin(const char* binPath) {
-  int totalLen = 0;
-  FILE* bin = fopen(binPath, "rb");
+   FILE* bin = fopen(binPath, "rb");
+  if (!bin) {
+    printf("%s not found\n", binPath);
+    exit(5);
+  }
+
   fseek(bin, 0, SEEK_END);
   int fLen = ftell(bin);
   fseek(bin, 0, SEEK_SET);
 
+  int totalLen = 0;
   while (1) {
     if (fread(&esp_image_header, sizeof(esp_image_header), 1, bin) != 1) break;
     if (esp_image_header.magic != 0xE9) break;
@@ -155,7 +178,11 @@ void readBin(const char* binPath) {
 
   fclose(bin);
 
-  printf("\t\t\t  Total len %6d\n\n", totalLen);
+  printf("\t\t\t  Total len %6d\n", totalLen);
+
+  readIrom(binPath);
+
+  printf("\n");
 }
 
 int checksum = 0xEF; // seed
@@ -224,6 +251,7 @@ void disasmAt(const char* symbol) {
   system("echo . >> disasm.txt");  // separator 
 }
 
+
 bool traversed, shrunk;
 
 void disasmCode(int startAddr, int stopAddr) {
@@ -279,6 +307,27 @@ void disasmAt(int startAddr, int stopAddr = 0) {
   } while (blockEnd < stopAddr);
 }
 
+int inCodeRegion(int start, int stop = 0) { // returns error address if not code region
+  switch (region(start)) {
+    case iram:
+    case irom:
+    case rom: return 0;
+  }
+
+  return start; // not code region
+
+  start &= 0xFFFFFFFC;
+  int retPos = start;
+  while (1) {
+    while (*(unsigned short*)(text + retPos) != 0xF00D) ++retPos; // or ill
+    if (stop && retPos > stop) return 0;
+    disasmAt(start, retPos + 2);
+    if (!stop) return 0;
+    retPos = start = (retPos + 2 + 3) & 0xFFFFFFFC;
+  }
+  return 0; // OK
+}
+
 void cleanDisasm() {
   if (!doDisasm) return;
 
@@ -295,7 +344,7 @@ void cleanDisasm() {
       if (l32rPos && *(l32rPos + 9 + 8) != ':') {
         int ref;
         sscanf(l32rPos + 9, "%X", &ref);
-        if (region(ref) == iram) {
+        if (!inCodeRegion(ref)) {
           int load = *(int*)(text + ref);
           *(l32rPos + 9 + 8) = ':';
           _itoa(load, l32rPos + 9 + 9, 16);
@@ -386,12 +435,16 @@ void compact() {
     mapToDispl[addr >> 2] = ofs;
     mapFromDispl[(addr >> 2) - ofs] = ofs;
     if (mark[addr]) lastMark = mark[addr];
-    if (addr > 0x90 // interrupt vectors don't move!
-    && lastMark >= code && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3]) { // unused hole
+    if (addr > iramBase + 0x90 // interrupt vectors don't move!
+    // && lastMark >= code // arrays between code
+    && !mark[addr] && !mark[addr+1] && !mark[addr+2] && !mark[addr+3]) { // unused hole
       ++ofs;
     } // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
 
+  // TODO: faster skip gap iram to irom0; above, below
+
+  // relocate code:
   int relo = first;
   for (addr = first; addr <= last;) {
     bool narrow = text[addr] & 0x8;  // MSB set = narrow p 575
@@ -408,7 +461,7 @@ void compact() {
       case data:
       case ptr : 
         dest = *(int*)(text + addr);
-        *(int*)(text + relo) = dest - (region(dest) == iram ? displ(dest) : 0);
+        *(int*)(text + relo) = dest - (inCodeRegion(dest) ? displ(dest) : 0);
         addr += 4;
         break;
 
@@ -477,6 +530,18 @@ Mark instrType(int addr) {
   return instr;
 }
 
+
+char* addrStr(int addr) {
+  static char str[32];
+  _itoa(addr, str, 16);
+  if (shrunk) {
+    str[8] = '(';
+    _itoa(origAddr(addr), str+9, 16);
+    str[17] = ')';
+  }
+  return str;
+}
+
 void onError(int addr, const char* type) {
   char cmd[64];
   sprintf_s(cmd, sizeof(cmd), "echo %s: >> disasm.txt", type);
@@ -486,14 +551,13 @@ void onError(int addr, const char* type) {
   for (int i = 4; i--;)
     stopAddr += text[stopAddr] & 0x8 ? 2 : 3;
 
-  printf("%6s @ %X(%X)\n", type, addr, origAddr(addr));
+  printf("%6s @ %s\n", type, addrStr(addr));
   disasmAt(addr, stopAddr);
 }
 
 void onError(int addr, int dest, int failedAt, const char* type) {
   char cmd[128];
-  int orig = origAddr(addr);
-  sprintf_s(cmd, sizeof(cmd), "echo %s @ %X(%X) to %X..%X >> disasm.txt", type, addr, orig, dest, failedAt);
+  sprintf_s(cmd, sizeof(cmd), "echo %s @ %s to %X..%X >> disasm.txt", type, addrStr(addr), dest, failedAt);
   system(cmd);
 
   if (dest >= 0 && failedAt >= dest) {
@@ -502,7 +566,7 @@ void onError(int addr, int dest, int failedAt, const char* type) {
     disasmAt(dest, failedAt);
   } else disasmAt(addr);
 
-  printf("%6s @ %X(%X)->%X..%X\n", type, addr, orig, dest, failedAt);
+  printf("%6s @ %s->%X..%X\n", type, addrStr(addr), dest, failedAt);
 }
 
 void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
@@ -519,32 +583,10 @@ void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
   disasmAt(addr, endAddr);
 }
 
-
-int inCodeRegion(int start, int stop = 0) { // returns error address if not code region
-  switch (region(start)) {
-    case iram:
-    case irom:
-    case rom : return 0;
-  }
-
-  return start; // not code region
-
-  start &= 0xFFFFFFFC;
-  int retPos = start;
-  while (1) {
-    while (*(unsigned short*)(text + retPos) != 0xF00D) ++retPos; // or ill
-    if (stop && retPos > stop) return 0;
-    disasmAt(start, retPos + 2);
-    if (!stop) return 0;
-    retPos = start = (retPos + 2 + 3) & 0xFFFFFFFC;
-  }
-  return 0; // OK
-}
-
 int traverse(int addr) {  // returns fail addr
   // printf("%X ", shrunk ? origAddr(addr):addr); // to compare
   while (1) {
-    if (region(addr) != iram) return 0;
+    if (region(addr) < iram) return 0;
 
     switch (mark[addr]) {
       case unk: break;  // still to traverse
@@ -655,8 +697,9 @@ int traverse(int addr) {  // returns fail addr
         continue;
 
       case ill: 
-        if (addr < 0x80) return 0; // vector calls don't return
+        if (addr > iramBase && addr < iramBase + 0x80) return 0; // vector calls often never return
         onError(addr, "ill");
+        return 0;
         return errorTrace ? addr : 0;
 
       default: onError(addr, "mark"); return addr;  // should never happen
