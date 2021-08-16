@@ -12,11 +12,10 @@
 // build firmware with VTABLES_IN_ROM 
 
 //Blinky
-// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin
+// platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin  
 // platform-espressif8266-develop\examples\esp8266-nonos-sdk-blink\.pio\build\nodemcuv2\firmware.bin.irom0text.bin 
-     // irom0text.bin is code from the static libraries located in \lib -- loaded with offset 0x40000 (blocks?)
-     // 400018A4 400018B4 ...
-     // lots of 4010xxxx refs to fix!!
+     // irom0text.bin is code from the static libraries located in \lib -- loaded into flash at offset 0x40000 (256K) 
+     // starts with 400018A4 400018B4; lots of 4010xxxx refs to fixup
 
 // Tasmota-development-9.5\.pio\build\tasmota-lite\firmware.bin     (has function pointers -- should be traversed)
 
@@ -442,7 +441,9 @@ void compact() {
     } // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
 
-  // TODO: faster skip gap iram to irom0; above, below
+  // TODO: faster: skip gap iram to irom0; above, below
+  // TODO: beware excess code to iram (32 + 16 (+ 16) KB max!!)
+  //    better ICACHE ALL code (check feature present)
 
   // relocate code:
   int relo = first;
@@ -459,7 +460,12 @@ void compact() {
     int dest;
     switch (mark[addr]) {
       case data:
-      case ptr : 
+      case ptr :
+        if (addr & 3) {
+          printf("Align %X !\n", addr);
+          ++addr;
+          continue;
+        }
         dest = *(int*)(text + addr);
         *(int*)(text + relo) = dest - (inCodeRegion(dest) ? displ(dest) : 0);
         addr += 4;
