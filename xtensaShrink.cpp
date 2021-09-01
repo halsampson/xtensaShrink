@@ -2,8 +2,7 @@
 
 // Blinky first
 
-// TODO: handle irom region
-// TODO: follow, check for any refs from irom to iram (would need offsets)
+// TODO: copyToElf irom0 correct offset!!
 
 // TODO: optional doNotFollow list for strtod, printf double, ... other bloat; stub
 // data arrays: look for addr + ofs code 
@@ -42,13 +41,13 @@ bool errorTrace = 1;
 
 const int dramBase = 0x3FFE8000;
 const int iramBase = 0x40100000;
-const int _irom0_text_start = 0x40210000;
+const int _irom0_text_start = 0x40210000;  // ???
+const int iromBase = _irom0_text_start;
 const int MaxAddr = 0x40300000;
 
 const int MinAddr = dramBase;
 const int MaxCodeSize = MaxAddr - MinAddr;
 
-int topAddr;
 BYTE textA[MaxCodeSize];
 BYTE* text = textA - MinAddr;
 
@@ -116,7 +115,8 @@ struct {
 //...
 // https://github.com/espressif/esptool/wiki/Firmware-Image-Format
 // https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/app_image_format.html
-
+ 
+int iramEnd, iromEnd;
 
 void readIrom(const char* binPath) {
   char iromPath[256];
@@ -126,11 +126,10 @@ void readIrom(const char* binPath) {
   FILE* bin = fopen(iromPath, "rb");
   if (!bin) return;
   int len = (int)fread(text + _irom0_text_start, 1, 0x100000, bin);
-  topAddr = _irom0_text_start + len;
+  iromEnd = _irom0_text_start + len;
   printf("irom len %d\n", len);
   fclose(bin);
 }
-
 
 void readBin(const char* binPath) {
    FILE* bin = fopen(binPath, "rb");
@@ -155,12 +154,20 @@ void readBin(const char* binPath) {
       int endAddr = esp_image_segment_header[i].load_addr + esp_image_segment_header[i].data_len;
       printf("Segment @ %X to %X, len %6d\n", esp_image_segment_header[i].load_addr, endAddr, esp_image_segment_header[i].data_len);
       totalLen += esp_image_segment_header[i].data_len;
-      if (endAddr > topAddr) {
-        topAddr = endAddr;
-        if (topAddr > MaxAddr) {
-          printf("increase MaxCodeSize\n");
-          exit(9);
-        }
+
+      switch (region(endAddr)) {
+        case iram :
+          if (endAddr > iramEnd)
+             iramEnd = endAddr;
+          break;
+        case irom :
+          if (endAddr > MaxAddr) {
+            printf("increase MaxCodeSize\n");
+            exit(9);
+          }
+          if (endAddr > iromEnd)
+            iromEnd = endAddr;
+          break;
       }
 
       int ofs = esp_image_segment_header[i].load_addr;
@@ -192,8 +199,6 @@ void writeAndSum(const void* data, int len, FILE* bin) {
   for (int i = len; i--;)
     checksum ^= *d++;
 }
-
-int first, last;
 
 void writeBin(const char* binPath) {
   FILE* bin = fopen(binPath, "wb");
@@ -425,12 +430,10 @@ void addrAt(int addr) {
   printf("%X:%X %d\n", addr, *(int*)(text + addr), mark[addr]);
 }
 
-void compact() { 
-  // find holes for compacted displacement mapping:
+void mapHoles(int start, int end) { // find holes for compacted displacement mapping:
   int ofs = 0;
-  int addr;
   Mark lastMark = code;
-  for (addr = first; addr <= last; addr += 4) {
+  for (int addr = start; addr <= end; addr += 4) {
     mapToDispl[addr >> 2] = ofs;
     mapFromDispl[(addr >> 2) - ofs] = ofs;
     if (mark[addr]) lastMark = mark[addr];
@@ -440,27 +443,24 @@ void compact() {
       ++ofs;
     } // else printf("%4X->%4X  ", addr & 0xFFFF, (addr - (ofs << 2)) & 0xFFFF);  // map
   }
+}
 
-  // TODO: faster: skip gap iram to irom0; above, below
-  // TODO: beware excess code to iram (32 + 16 (+ 16) KB max!!)
-  //    better ICACHE ALL code (check feature present)
-
-  // relocate code:
-  int relo = first;
-  for (addr = first; addr <= last;) {
+int relocate(int start, int end) {  // returns end of relocated code
+  int relo = start;
+  for (int addr = start; addr <= end;) {
     bool narrow = text[addr] & 0x8;  // MSB set = narrow p 575
     if (mark[addr] == unk || mark[addr] == err) {
       ++addr;
       continue;
     }
- 
+
     int iDispl = displ(addr);
     relo = addr - iDispl; // relocated location
 
-    int dest;
+    int dest, ofs;
     switch (mark[addr]) {
       case data:
-      case ptr :
+      case ptr:
         if (addr & 3) {
           printf("Align %X !\n", addr);
           ++addr;
@@ -472,30 +472,38 @@ void compact() {
         break;
 
       default:
-        text[relo]   = text[addr];
+        text[relo] = text[addr];
         text[relo+1] = text[addr+1];
         if (!narrow)
-          text[relo+2] = text[addr+2];        
+          text[relo+2] = text[addr+2];
 
-        switch (mark[addr + 1]) { 
+        switch (mark[addr + 1]) {
           case imm6:  // forward offset
             ofs = imm6Dest(addr) - displ(imm6Dest(addr)) - (relo + 4);
             text[relo] = text[relo] & 0xCF | ofs & 0x30;  // MS 2 bits
             text[relo+1] = text[relo + 1] & 0x0F | (ofs & 0xF) << 4; // LS nibble -> MS nibble!
-            break; 
+            break;
           case imm8: text[relo+2] += iDispl - displ(imm8Dest(addr)); break; // signed
-          case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break; 
+          case imm12: *(int*)(text+relo) += (iDispl - displ(imm12Dest(addr))) << (24 - 12); break;
           case imm16: *(signed short*)(text+relo+1) += (iDispl - displ(imm16Dest(addr))) >> 2; break;  // back offset (one-extended negative)
           case imm18: *(int*)(text+relo) += (iDispl - displ(jmpDest(addr))) << (24 - 18); break;
-          case imm20 : *(int*)(text+relo) += (iDispl - displ(call0Dest(addr))) << (24 - 20); break;
+          case imm20: *(int*)(text+relo) += (iDispl - displ(call0Dest(addr))) << (24 - 20); break;
         }
         addr += narrow ? 2 : 3;
         break;
-    }   
+    }
   }
-  last = relo;
+  return relo;
+}
 
-  printf("\nPacked to %d bytes\n", last - first);
+void compact() { 
+  mapHoles(iramBase, iramEnd);
+  mapHoles(iromBase, iromEnd);
+
+  iramEnd = relocate(iramBase, iramEnd);
+  iromEnd = relocate(iromBase, iromEnd); // TODO: big
+
+  printf("\nPacked to %d bytes\n", (iramEnd - iramBase) + (iromEnd - iromBase) + 2);
 
   traversed = false;
   shrunk = true;
@@ -565,6 +573,7 @@ void onError(int addr, int dest, int failedAt, const char* type) {
   char cmd[128];
   sprintf_s(cmd, sizeof(cmd), "echo %s @ %s to %X..%X >> disasm.txt", type, addrStr(addr), dest, failedAt);
   system(cmd);
+  printf("%6s @ %s->%X..%X\n", type, addrStr(addr), dest, failedAt);
 
   if (dest >= 0 && failedAt >= dest) {
     for (int i = 4; i--;)
@@ -572,7 +581,14 @@ void onError(int addr, int dest, int failedAt, const char* type) {
     disasmAt(dest, failedAt);
   } else disasmAt(addr);
 
-  printf("%6s @ %s->%X..%X\n", type, addrStr(addr), dest, failedAt);
+#if 0
+  if (shrunk) { // original to compare -- disasm from orignal elf file !! TODO *****
+    dest = origAddr(dest);
+    failedAt = origAddr(failedAt);
+    disasmAt(dest, failedAt);
+  }
+#endif
+
 }
 
 void dumpCode(int addr) { // disasm from addr to ret, ill, or jmp
@@ -740,9 +756,10 @@ void copyToElf(int start = 0, int len = 0) {  // only for objdump disasm!!
   // https://github.com/jsandin/esp-bin2elf/blob/master/esp_bin2elf.py
 }
 
-int countMarked() {
+int countMarked(int start, int end) {
   int marked = 0;
-  for (int addr = MinAddr; addr < topAddr; addr += 4)
+  int first, last;
+  for (int addr = start; addr < end; addr += 4)
     if (mark[addr]) {
       if (!marked) {
         first = addr;
@@ -787,10 +804,13 @@ int main(int argc, char** argv) {
 
   markIntrs();
   traversed = true;
-  int markedOrig = countMarked();
+  int markedOrig = countMarked(iramBase, iramEnd) + countMarked(iromBase, iromEnd);
 
-  disasmAt(first, last + 1);
+#if 0
+  disasmAt(irmaBase, iramEnd);
+  disasmAt(_irom0_text_start, last + 1);
   cleanDisasm();
+#endif
   system("copy disasm.clean.txt disasm.txt >> NUL");
 
   system("echo . >> disasm.txt");
@@ -798,16 +818,20 @@ int main(int argc, char** argv) {
   system("echo . >> disasm.txt");
 
   if (doCompact) {
+    printf("Packing...\n");
     compact();
   }
 
-  copyToElf(first, last - first + 1);
+  copyToElf(iramBase, iramEnd - iramBase + 1);
+
+  // TODO: write irom0text file
+
   errorTrace = true;
   traverse(packedAddr(esp_image_header.entry_addr));
   markIntrs();
   traversed = true;
-  int markedShrink = countMarked();
-  disasmAt(first, last + 1);
+  int markedShrink = countMarked(iramBase, iramEnd) + countMarked(iromBase, iromEnd);
+  disasmAt(iramBase, iramEnd + 1);
 
   cleanDisasm();
 
@@ -816,6 +840,8 @@ int main(int argc, char** argv) {
     writeBin(binPath);
     char espCmd[512]; strcpy(espCmd, EspTool); strcat(espCmd, binPath);
     system(espCmd);
+
+    // TODO: flash shrunk irom0text
   }
 }
 
@@ -845,9 +871,9 @@ Wrote 26464 bytes (19810 compressed) at 0x00000000 in 0.2 seconds (effective 132
 /*
 https://github.com/esp8266/esp8266-wiki/wiki/Memory-Map
 
-I/O: 0x3FF00000..0x3FFC0000
-RAM: 0x3FFE0000..0x40000000   (<50 KB of 80KB available??) stack/heap
-ROM: 0x40000000..0x40100000   (x2)
+ I/O: 0x3FF00000..0x3FFC0000
+ RAM: 0x3FFE0000..0x40000000   (<50 KB of 80KB available??) stack/heap
+ ROM: 0x40000000..0x40100000   (x2)
 IRAM: 0x40100000..0x40140000   32KB, loaded from flash by bootloader
 IROM: 0x40200000..0x40280000   SPI flash
 config: 0x60000000..0x60002000
@@ -907,6 +933,17 @@ Code in IROM runs at 1/4 - 1/12 speed since SPI flash (four data lines) is not n
 Interrupt handlers and code that writes to flash must be run from IRAM.
 
 ICACHE_FLASH_ATTR -> place in IROM
+
+
+SDK 1.5 flash map is as follows for 4096 KB flash size:
+
+00 0000 - 00 FFFF = Flash.bin     (max 64 KB)
+01 0000 - 03 BFFF = User Data     (176 KB + any leftover in flash.bin's 64 KB space)
+03 C000 - 03 FFFF = User Param    (16 KB)
+04 0000 - 0F FFFF = Irom0text.bin (max 768 KB)
+0C 0000 - 3F BFFF = User Data     (3056 KB + any leftover in Irom0text.bin's 768 KB space)
+3F C000 - 3F FFFF = System Param  (16 KB)
+
 */
 
 
